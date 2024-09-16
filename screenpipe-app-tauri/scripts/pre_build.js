@@ -70,27 +70,18 @@ const config = {
     },
 }
 
-async function findWget() {
-    const possiblePaths = [
-        'C:\\ProgramData\\chocolatey\\bin\\wget.exe',
-        'C:\\Program Files\\Git\\mingw64\\bin\\wget.exe',
-        'C:\\msys64\\usr\\bin\\wget.exe',
-        'C:\\Windows\\System32\\wget.exe',
-        'wget'
-    ];
+async function downloadFile(url, outputPath) {
+    console.log(`Downloading ${url} to ${outputPath}`);
+    const powershellCommand = `
+        $ProgressPreference = 'SilentlyContinue';
+        Invoke-WebRequest -Uri "${url}" -OutFile "${outputPath}"
+    `;
+    execSync(`powershell -Command "${powershellCommand}"`, { stdio: 'inherit' });
+}
 
-    for (const wgetPath of possiblePaths) {
-        try {
-            execSync(`${wgetPath} --version`, { stdio: 'ignore' });
-            console.log(`wget found at: ${wgetPath}`);
-            return wgetPath;
-        } catch (error) {
-            // wget not found at this path, continue searching
-        }
-    }
-
-    console.error('wget not found. Please install wget and make sure it\'s in your PATH.');
-    process.exit(1);
+// Replace findWget with a function that always returns our download function
+async function getDownloader() {
+    return downloadFile;
 }
 
 // Export for Github actions
@@ -153,9 +144,18 @@ async function main() {
             // uncomment the following line if you want the script to exit on failure
             // process.exit(1);
         }
-    } else if (platform === 'windows') {
+	} else if (platform === 'windows') {
         // Windows-specific code
-        const wgetPath = await findWget();
+        const downloader = await getDownloader();
+
+        // Add LLVM to PATH
+        const llvmPath = 'C:\\Program Files\\LLVM\\bin';
+        process.env.PATH = `${llvmPath};${process.env.PATH}`;
+        console.log('Added LLVM to PATH');
+
+		// Set CC environment variable to use cl.exe
+		process.env.CC = 'cl.exe';
+		console.log('Set CC environment variable to cl.exe');
 
         console.log('Copying screenpipe binary...');
 
@@ -187,13 +187,12 @@ async function main() {
         }
 
         // Setup FFMPEG
-        if (!(await fs.stat(config.ffmpegRealname).catch(() => false))) {
-            await runCommand(`${wgetPath} -nc --no-check-certificate --show-progress ${config.windows.ffmpegUrl} -O ${config.windows.ffmpegName}.7z`);
-            await runCommand(`"C:\\Program Files\\7-Zip\\7z.exe" x ${config.windows.ffmpegName}.7z`);
-            await fs.rename(config.windows.ffmpegName, config.ffmpegRealname);
-            await fs.rm(`${config.windows.ffmpegName}.7z`);
-            await runCommand(`move ${config.ffmpegRealname}\\lib\\x64\\* ${config.ffmpegRealname}\\lib\\`);
-        }
+		if (!(await fs.stat(config.ffmpegRealname).catch(() => false))) {
+			console.log('Using globally installed FFmpeg');
+			await fs.mkdir(config.ffmpegRealname);
+			await fs.mkdir(path.join(config.ffmpegRealname, 'bin'));
+			await fs.symlink('ffmpeg.exe', path.join(config.ffmpegRealname, 'bin', 'ffmpeg.exe'));
+		}
 
         // Setup Tesseract
         const tesseractName = 'tesseract-setup';
@@ -341,45 +340,29 @@ async function main() {
         if (process.env['CUDA_PATH']) {
             cudaPath = process.env['CUDA_PATH'];
         } else if (platform === 'windows') {
-            const cudaRoot = 'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\';
-            cudaPath = 'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.5';
+            const cudaRoot = 'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA';
             if (await fs.stat(cudaRoot).catch(() => false)) {
                 const folders = await fs.readdir(cudaRoot);
                 if (folders.length > 0) {
-                    cudaPath = cudaPath.replace('v12.5', folders[0]);
+                    // Sort folders by version number and get the latest
+                    const latestVersion = folders.sort((a, b) => {
+                        const vA = a.replace('v', '').split('.').map(Number);
+                        const vB = b.replace('v', '').split('.').map(Number);
+                        for (let i = 0; i < vA.length; i++) {
+                            if (vA[i] !== vB[i]) return vB[i] - vA[i];
+                        }
+                        return 0;
+                    })[0];
+                    cudaPath = path.join(cudaRoot, latestVersion);
                 }
             }
         }
 
-        if (process.env.GITHUB_ENV) {
-            console.log('CUDA_PATH', cudaPath);
-        }
-
-        if (platform === 'windows') {
-            const windowsConfig = {
-                bundle: {
-                    resources: {
-                        'ffmpeg\\bin\\x64\\*': './',
-                        'openblas\\bin\\*.dll': './',
-                        [`${cudaPath}\\bin\\cudart64_*`]: './',
-                        [`${cudaPath}\\bin\\cublas64_*`]: './',
-                        [`${cudaPath}\\bin\\cublasLt64_*`]: './',
-                        'tesseract\\*': './',
-                        'onnxruntime*\\lib\\*.dll': './',
-                    },
-                    externalBin: [
-                        'screenpipe'
-                    ]
-                },
-            };
-            await fs.writeFile('tauri.windows.conf.json', JSON.stringify(windowsConfig, null, 4));
-        }
-        if (platform === 'linux') {
-            // Add cuda toolkit depends package
-            const tauriConfigContent = await fs.readFile('tauri.linux.conf.json', { encoding: 'utf-8' });
-            const tauriConfig = JSON.parse(tauriConfigContent);
-            tauriConfig.bundle.linux.deb.depends.push('nvidia-cuda-toolkit');
-            await fs.writeFile('tauri.linux.conf.json', JSON.stringify(tauriConfig, null, 4));
+        if (cudaPath) {
+            process.env.CUDA_PATH = cudaPath;
+            console.log('CUDA_PATH set to:', cudaPath);
+        } else {
+            console.warn('CUDA path not found. CUDA features may not be available.');
         }
     }
 
