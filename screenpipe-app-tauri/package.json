@@ -1,7 +1,6 @@
 {
   "name": "screenpipe-app",
   "private": true,
-  "type": "module",
   "scripts": {
     "dev": "next dev",
     "start": "next start",
