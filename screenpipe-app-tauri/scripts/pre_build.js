@@ -15,7 +15,7 @@ const originalCWD = process.cwd();
 // Change CWD to src-tauri
 process.chdir(path.join(__dirname, '../src-tauri'));
 const platform = {
-    win32: os.arch() === 'arm64' ? 'windows-arm64' : 'windows',
+    win32: 'windows',
     darwin: 'macos',
     linux: 'linux',
 }[os.platform()];
@@ -103,27 +103,6 @@ async function runCommand(command) {
     }
 }
 
-async function buildV8FromSource() {
-    // Clone V8 repository
-    await runCommand('git clone https://chromium.googlesource.com/v8/v8.git');
-    process.chdir('v8');
-
-    // Fetch dependencies
-    await runCommand('gclient sync');
-
-    // Configure for ARM64
-    await runCommand('gn gen out.gn/arm64.release --args="target_cpu=\\"arm64\\" is_debug=false"');
-
-    // Build
-    await runCommand('ninja -C out.gn/arm64.release v8_monolith');
-
-    // Copy the built library to the expected location
-    const v8LibPath = path.join(cwd, 'rusty_v8_release_aarch64-pc-windows-msvc.lib');
-    await fs.copyFile('out.gn/arm64.release/obj/v8_monolith.lib', v8LibPath);
-
-    process.chdir('..');
-}
-
 // Wrap the main execution in an async function
 async function main() {
     if (platform === 'linux') {
@@ -165,12 +144,9 @@ async function main() {
             // uncomment the following line if you want the script to exit on failure
             // process.exit(1);
         }
-	} else if (platform === 'windows' || platform === 'windows-arm64') {
-		// Windows-specific code
-		if (platform === 'windows-arm64') {
-			console.log('Detected Windows ARM64 platform. Building V8 from source...');
-			await buildV8FromSource();
-		}        const downloader = await getDownloader();
+	} else if (platform === 'windows') {
+        // Windows-specific code
+        const downloader = await getDownloader();
 
         // Add LLVM to PATH
         const llvmPath = 'C:\\Program Files\\LLVM\\bin';
@@ -360,11 +336,7 @@ async function main() {
 
     // Nvidia
     let cudaPath;
-	if (platform === 'windows-arm64') {
-		console.log('Using locally built V8 library for Windows ARM64');
-		process.env.V8_FROM_SOURCE = 'true';
-		process.env.RUSTY_V8_ARCHIVE = path.join(cwd, 'rusty_v8_release_aarch64-pc-windows-msvc.lib');
-	} else if (hasFeature('cuda')) {
+    if (hasFeature('cuda')) {
         if (process.env['CUDA_PATH']) {
             cudaPath = process.env['CUDA_PATH'];
         } else if (platform === 'windows') {
