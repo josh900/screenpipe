@@ -15,7 +15,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Progress } from "@/components/ui/progress";
-import { Textarea } from "@/components/ui/textarea";
 import { DateTimePicker } from "./date-time-picker";
 import { Badge } from "./ui/badge";
 import {
@@ -32,13 +31,14 @@ import {
   Loader2,
   Search,
   Send,
+  X,
+  Square,
 } from "lucide-react";
 import { useToast } from "./ui/use-toast";
 import posthog from "posthog-js";
 import { AnimatePresence, motion } from "framer-motion";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { convertToCoreMessages, generateId, Message, streamText } from "ai";
-import { createOpenAI } from "@ai-sdk/openai";
 import { OpenAI } from "openai";
 import { ChatMessage } from "./chat-message-v2";
 import { spinner } from "./spinner";
@@ -49,8 +49,14 @@ import {
   AccordionTrigger,
 } from "./ui/accordion";
 import { VideoComponent } from "./video";
-import { Dialog, DialogContent, DialogTrigger } from "./ui/dialog";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "./ui/dialog";
 import {
   Tooltip,
   TooltipContent,
@@ -59,8 +65,14 @@ import {
 } from "./ui/tooltip";
 import { Separator } from "./ui/separator";
 import { useInputHistory } from "@/lib/hooks/use-input-history";
-// Add this constant at the top of the file
-const MAX_CONTENT_LENGTH = 30000; // Adjust as needed
+import { ContextUsageIndicator } from "./context-usage-indicator";
+import { Checkbox } from "@/components/ui/checkbox";
+import { formatISO } from "date-fns";
+import { IconCode } from "@/components/ui/icons";
+import { CodeBlock } from "./ui/codeblock";
+import { SqlAutocompleteInput } from "./sql-autocomplete-input";
+import { encode } from "@/lib/utils";
+import { ExampleSearch, ExampleSearchCards } from "./example-search-cards";
 
 export function SearchChat() {
   // Search state
@@ -80,7 +92,7 @@ export function SearchChat() {
   const [totalResults, setTotalResults] = useState(0);
   const { settings } = useSettings();
   const [isAiLoading, setIsAiLoading] = useState(false);
-  const [minLength, setMinLength] = useState(100);
+  const [minLength, setMinLength] = useState(50);
   const [maxLength, setMaxLength] = useState(10000);
 
   // Chat state
@@ -98,44 +110,118 @@ export function SearchChat() {
   const appNameHistory = useInputHistory("app_name");
   const windowNameHistory = useInputHistory("window_name");
 
+  const [isUserScrolling, setIsUserScrolling] = useState(false);
+  const lastScrollPosition = useRef(0);
+
+  const MAX_CONTENT_LENGTH = settings.aiMaxContextChars;
+
+  const [selectedResults, setSelectedResults] = useState<Set<number>>(
+    new Set()
+  );
+  const [hoveredResult, setHoveredResult] = useState<number | null>(null);
+
+  const [isCurlDialogOpen, setIsCurlDialogOpen] = useState(false);
+
+  const [isStreaming, setIsStreaming] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  const [selectAll, setSelectAll] = useState(true);
+
+  const [showExamples, setShowExamples] = useState(true);
+
+  const [hasSearched, setHasSearched] = useState(false);
+
+  const handleExampleSelect = async (example: ExampleSearch) => {
+    posthog.capture("example_search", { example: example.title });
+
+    const newWindowName = example.windowName || "";
+    const newAppName = example.appName || "";
+    const newLimit = example.limit || limit;
+    const newMinLength = example.minLength || minLength;
+    const newContentType =
+      (example.contentType as "all" | "ocr" | "audio") || contentType;
+    const newStartDate = example.startDate;
+
+    setWindowName(newWindowName);
+    setAppName(newAppName);
+    setLimit(newLimit);
+    setMinLength(newMinLength);
+    setContentType(newContentType);
+    setStartDate(newStartDate);
+    setShowExamples(false);
+
+    handleSearch(0, {
+      windowName: newWindowName,
+      appName: newAppName,
+      limit: newLimit,
+      minLength: newMinLength,
+      contentType: newContentType,
+      startDate: newStartDate,
+    });
+  };
+
+  const generateCurlCommand = () => {
+    const baseUrl = "http://localhost:3030";
+    const params = {
+      content_type: contentType,
+      limit: limit.toString(),
+      offset: offset.toString(),
+      start_time: startDate.toISOString(),
+      end_time: endDate.toISOString(),
+      min_length: minLength.toString(),
+      max_length: maxLength.toString(),
+      q: query,
+      app_name: appName,
+      window_name: windowName,
+      include_frames: includeFrames ? "true" : undefined,
+    };
+
+    const queryParams = Object.entries(params)
+      .filter(([_, value]) => value !== undefined && value !== "")
+      .map(([key, value]) => `${key}=${encodeURIComponent(value!)}`)
+      .join("&");
+
+    return `curl "${baseUrl}/search?${queryParams}" | jq`;
+  };
+
+  useEffect(() => {
+    if (results.length > 0) {
+      setSelectedResults(new Set(results.map((_, index) => index)));
+      setSelectAll(true);
+    }
+  }, [results]);
+
   useEffect(() => {
     const handleScroll = () => {
+      const currentScrollPosition = window.scrollY;
       const scrollPercentage =
-        (window.scrollY /
+        (currentScrollPosition /
           (document.documentElement.scrollHeight - window.innerHeight)) *
         100;
       const shouldShow = scrollPercentage < 90; // Show when scrolled up more than 10%
 
       setShowScrollButton(shouldShow);
+
+      // Check if user is scrolling up while AI is loading
+      if (isAiLoading && currentScrollPosition < lastScrollPosition.current) {
+        setIsUserScrolling(true);
+      }
+
+      lastScrollPosition.current = currentScrollPosition;
     };
 
     window.addEventListener("scroll", handleScroll);
 
-    // Trigger initial check
-    handleScroll();
-
     return () => window.removeEventListener("scroll", handleScroll);
-  }, []);
+  }, [isAiLoading]);
 
   const scrollToBottom = () => {
-    window.scrollTo({
-      top: document.documentElement.scrollHeight,
-      behavior: "smooth",
-    });
-  };
-  // Add this function to calculate total content length
-  const calculateTotalContentLength = (results: ContentItem[]): number => {
-    return results.reduce((total, item) => {
-      const contentLength =
-        item.type === "OCR"
-          ? item.content.text.length
-          : item.type === "Audio"
-          ? item.content.transcription.length
-          : item.type === "FTS"
-          ? item.content.matched_text.length
-          : 0;
-      return total + contentLength;
-    }, 0);
+    if (!isUserScrolling) {
+      window.scrollTo({
+        top: document.documentElement.scrollHeight,
+        behavior: "smooth",
+      });
+    }
   };
 
   useEffect(() => {
@@ -158,15 +244,51 @@ export function SearchChat() {
     }
   }, [isFloatingInputVisible]);
 
+  const handleResultSelection = (index: number) => {
+    setSelectedResults((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(index)) {
+        newSet.delete(index);
+      } else {
+        newSet.add(index);
+      }
+      return newSet;
+    });
+  };
+
+  const calculateSelectedContentLength = () => {
+    return Array.from(selectedResults).reduce((total, index) => {
+      const item = results[index];
+      if (!item || !item.type) return total; // Add this check
+
+      const contentLength =
+        item.type === "OCR"
+          ? item.content.text.length
+          : item.type === "Audio"
+          ? item.content.transcription.length
+          : item.type === "FTS"
+          ? item.content.matched_text.length
+          : 0;
+      return total + contentLength;
+    }, 0);
+  };
+
   const handleFloatingInputSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!floatingInput.trim()) return;
+    if (!floatingInput.trim() && !isStreaming) return;
 
-    const totalContentLength = calculateTotalContentLength(results);
-    if (totalContentLength > MAX_CONTENT_LENGTH) {
+    if (isStreaming) {
+      handleStopStreaming();
+      return;
+    }
+
+    scrollToBottom();
+
+    const selectedContentLength = calculateSelectedContentLength();
+    if (selectedContentLength > MAX_CONTENT_LENGTH) {
       toast({
         title: "Content too large",
-        description: `The total content length (${totalContentLength} characters) exceeds the maximum allowed (${MAX_CONTENT_LENGTH} characters). Please refine your search to reduce the amount of content.`,
+        description: `The selected content length (${selectedContentLength} characters) exceeds the maximum allowed (${MAX_CONTENT_LENGTH} characters). Please unselect some items to reduce the amount of content.`,
         variant: "destructive",
       });
       return;
@@ -198,7 +320,9 @@ export function SearchChat() {
           content: `You are a helpful assistant.
             The user is using a product called "screenpipe" which records
             his screen and mics 24/7. The user ask you questions
-            and you use his screenpipe recordings to answer him.
+            and you use his screenpipe recordings to answer him. 
+            The user will provide you with a list of search results
+            and you will use them to answer his questions.
 
             Rules:
             - Current time (JavaScript Date.prototype.toString): ${new Date().toString()}. Adjust start/end times to match user intent.
@@ -210,9 +334,6 @@ export function SearchChat() {
             - You must reformat timestamps to a human-readable format in your response to the user.
             - Never output UTC time unless explicitly asked by the user.
             - Do not try to embed videos in table (would crash the app)
-            
-            Based on the following search results:
-            ${JSON.stringify(results)}
             `,
         },
         ...chatMessages.map((msg) => ({
@@ -221,15 +342,27 @@ export function SearchChat() {
         })),
         {
           role: "user" as const,
-          content: userMessage.content,
+          content: `Context data: ${JSON.stringify(
+            results.filter((_, index) => selectedResults.has(index))
+          )}
+          
+          User query: ${floatingInput}`,
         },
       ];
 
-      const stream = await openai.chat.completions.create({
-        model: model,
-        messages: messages,
-        stream: true,
-      });
+      abortControllerRef.current = new AbortController();
+      setIsStreaming(true);
+
+      const stream = await openai.chat.completions.create(
+        {
+          model: model,
+          messages: messages,
+          stream: true,
+        },
+        {
+          signal: abortControllerRef.current.signal,
+        }
+      );
 
       let fullResponse = "";
       // @ts-ignore
@@ -238,7 +371,10 @@ export function SearchChat() {
         { role: "assistant", content: "" },
       ]);
 
+      setIsUserScrolling(false);
+      lastScrollPosition.current = window.scrollY;
       scrollToBottom();
+
       for await (const chunk of stream) {
         const content = chunk.choices[0]?.delta?.content || "";
         fullResponse += content;
@@ -249,22 +385,37 @@ export function SearchChat() {
         ]);
         scrollToBottom();
       }
-    } catch (error) {
-      console.error("Error generating AI response:", error);
-      toast({
-        title: "Error",
-        description: "Failed to generate AI response. Please try again.",
-        variant: "destructive",
-      });
+    } catch (error: any) {
+      if (error.toString().includes("aborted")) {
+        console.log("Streaming was aborted");
+      } else {
+        console.error("Error generating AI response:", error);
+        toast({
+          title: "Error",
+          description: "Failed to generate AI response. Please try again.",
+          variant: "destructive",
+        });
+      }
     } finally {
       setIsAiLoading(false);
       setIsFloatingInputVisible(false);
-      // Scroll to bottom again after the response is complete
-      scrollToBottom();
+      setIsStreaming(false);
+      if (!isUserScrolling) {
+        scrollToBottom();
+      }
     }
   };
 
-  const handleSearch = async (newOffset = 0) => {
+  const handleStopStreaming = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      setIsStreaming(false);
+      setIsAiLoading(false);
+    }
+  };
+
+  const handleSearch = async (newOffset = 0, overrides: any = {}) => {
+    setHasSearched(true);
     queryHistory.saveToHistory();
     appNameHistory.saveToHistory();
     windowNameHistory.saveToHistory();
@@ -276,58 +427,41 @@ export function SearchChat() {
     setChatMessages([]);
     scrollToBottom();
     setResults([]);
-    let allFilteredResults: ContentItem[] = [];
-    let currentOffset = newOffset;
-    let totalUnfilteredResults = 0;
 
-    while (allFilteredResults.length < limit) {
+    try {
       const response = await queryScreenpipe({
         q: query || undefined,
-        content_type: contentType as "all" | "ocr" | "audio",
-        limit: limit * 1.5, // TODO huge hack
-        offset: currentOffset,
-        start_time: startDate.toISOString().replace(/\.\d{3}Z$/, "Z"),
-        end_time: endDate.toISOString().replace(/\.\d{3}Z$/, "Z"),
-        app_name: appName || undefined,
-        window_name: windowName || undefined,
+        content_type: overrides.contentType || contentType,
+        limit: overrides.limit || limit,
+        offset: newOffset,
+        start_time:
+          overrides.startDate?.toISOString() || startDate.toISOString(),
+        end_time: endDate.toISOString(),
+        app_name: overrides.appName || appName || undefined,
+        window_name: overrides.windowName || windowName || undefined,
         include_frames: includeFrames,
+        min_length: overrides.minLength || minLength,
+        max_length: maxLength,
       });
 
-      if (response && response.data.length > 0) {
-        console.log("response", response);
-        const filteredResults = response.data.filter((item) => {
-          const contentLength =
-            item.type === "OCR"
-              ? item.content.text.length
-              : item.type === "Audio"
-              ? item.content.transcription.length
-              : item.type === "FTS"
-              ? item.content.matched_text.length
-              : 0;
-          return contentLength >= minLength && contentLength <= maxLength;
-        });
-        allFilteredResults = [...allFilteredResults, ...filteredResults];
-        // Update progress based on fetched results
-        const currentProgress = Math.min(
-          (allFilteredResults.length / limit) * 100,
-          100
-        );
-        setProgress(currentProgress);
-
-        currentOffset += response.data.length;
-        totalUnfilteredResults = response.pagination.total;
-      } else {
-        break; // No more results to fetch
+      if (!response || !Array.isArray(response.data)) {
+        throw new Error("invalid response data");
       }
 
-      if (currentOffset >= totalUnfilteredResults) {
-        break; // We've fetched all available results
-      }
+      setResults(response.data);
+      setTotalResults(response.pagination.total);
+    } catch (error) {
+      console.error("search error:", error);
+      toast({
+        title: "error",
+        description: "failed to fetch search results. please try again.",
+        variant: "destructive",
+      });
+      setResults([]);
+      setTotalResults(0);
+    } finally {
+      setIsLoading(false);
     }
-
-    setResults(allFilteredResults.slice(0, limit));
-    setTotalResults(allFilteredResults.length);
-    setIsLoading(false);
   };
 
   const handleNextPage = () => {
@@ -339,6 +473,23 @@ export function SearchChat() {
   const handlePrevPage = () => {
     if (offset - limit >= 0) {
       handleSearch(offset - limit);
+    }
+  };
+
+  const handleBadgeClick = (value: string, type: "app" | "window") => {
+    if (type === "app") {
+      setAppName(value);
+    } else {
+      setWindowName(value);
+    }
+  };
+
+  const handleSelectAll = (checked: boolean) => {
+    setSelectAll(checked);
+    if (checked) {
+      setSelectedResults(new Set(results.map((_, index) => index)));
+    } else {
+      setSelectedResults(new Set());
     }
   };
 
@@ -358,111 +509,159 @@ export function SearchChat() {
         ));
     }
 
-    if (results.length === 0) {
-      return <p className="text-center">No results found</p>;
+    if (hasSearched && results.length === 0) {
+      return <p className="text-center">no results found</p>;
     }
 
-    return results.map((item, index) => (
-      <Card key={index}>
-        <CardContent className="p-4">
-          <Accordion type="single" collapsible className="w-full">
-            <AccordionItem value={`item-${index}`}>
-              <AccordionTrigger className="flex items-center">
-                <div className="flex items-center w-full">
-                  <Badge className="mr-2">{item.type}</Badge>
-                </div>
-                <span className="flex-grow text-center truncate">
-                  {item.type === "OCR" && item.content.text.substring(0, 50)}
-                  {item.type === "Audio" &&
-                    item.content.transcription.substring(0, 50)}
-                  {item.type === "FTS" &&
-                    item.content.matched_text.substring(0, 50)}
-                  ...
-                </span>
-              </AccordionTrigger>
-              <AccordionContent>
-                {item.type === "OCR" && (
-                  <>
-                    <p className="mt-2">{item.content.text}</p>
-                    <div className="flex justify-center mt-4">
-                      <VideoComponent filePath={item.content.file_path} />
-                    </div>
-                    {includeFrames && item.content.frame && (
-                      <Dialog>
-                        <DialogTrigger asChild>
-                          <img
-                            src={`data:image/jpeg;base64,${item.content.frame}`}
-                            alt="Frame"
-                            className="mt-2 w-24 h-auto cursor-pointer"
-                          />
-                        </DialogTrigger>
-                        <DialogContent className="sm:max-w-[80vw]">
-                          <img
-                            src={`data:image/jpeg;base64,${item.content.frame}`}
-                            alt="Frame"
-                            className="w-full h-auto"
-                          />
-                        </DialogContent>
-                      </Dialog>
-                    )}
-                  </>
-                )}
-                {item.type === "Audio" && (
-                  <>
-                    <p className="mt-2">{item.content.transcription}</p>
-                    <div className="flex justify-center mt-4">
-                      <VideoComponent filePath={item.content.file_path} />
-                    </div>
-                  </>
-                )}
-                {item.type === "FTS" && (
-                  <>
-                    <p className="mt-2">{item.content.matched_text}</p>
-                    {item.content.original_frame_text && (
-                      <p className="mt-2 text-sm text-gray-600">
-                        Original: {item.content.original_frame_text}
-                      </p>
-                    )}
-                  </>
-                )}
-              </AccordionContent>
-            </AccordionItem>
-          </Accordion>
-          <div className="flex flex-wrap items-center gap-2 mt-2">
-            <p className="text-xs text-gray-400">
-              {new Date(item.content.timestamp).toLocaleString()}
-            </p>
-            {item.type === "OCR" && item.content.app_name && (
-              <Badge
-                className="text-xs cursor-pointer"
-                onClick={() => setAppName(item.content.app_name)}
+    if (!hasSearched || results.length === 0) {
+      return null;
+    }
+
+    return results
+      .filter((item) => item && item.type)
+      .map((item, index) => (
+        <motion.div
+          key={index}
+          className="flex items-center mb-4 relative pl-8"
+          onHoverStart={() => setHoveredResult(index)}
+          onHoverEnd={() => setHoveredResult(null)}
+        >
+          <AnimatePresence>
+            {hoveredResult === index && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.2 }}
+                className="absolute left-0 top-1/2 transform -translate-y-1/2"
               >
-                {item.content.app_name}
-              </Badge>
+                <Checkbox
+                  checked={selectedResults.has(index)}
+                  onCheckedChange={() => handleResultSelection(index)}
+                />
+              </motion.div>
             )}
-            {item.type === "OCR" && item.content.window_name && (
-              <Badge
-                className="text-xs cursor-pointer"
-                onClick={() => setWindowName(item.content.window_name)}
-              >
-                {item.content.window_name}
-              </Badge>
-            )}
-            {item.content.tags &&
-              item.content.tags.map((tag, index) => (
-                <Badge key={index} className="text-xs">
-                  {tag}
-                </Badge>
-              ))}
-          </div>
-        </CardContent>
-      </Card>
-    ));
+          </AnimatePresence>
+          <Card className="w-full">
+            <CardContent className="p-4">
+              <Accordion type="single" collapsible className="w-full">
+                <AccordionItem value={`item-${index}`}>
+                  <AccordionTrigger className="flex items-center">
+                    <div className="flex items-center w-full">
+                      <Badge className="mr-2">{item.type}</Badge>
+                    </div>
+                    <span className="flex-grow text-center truncate">
+                      {item.type === "OCR" &&
+                        item.content.text.substring(0, 50)}
+                      {item.type === "Audio" &&
+                        item.content.transcription.substring(0, 50)}
+                      {item.type === "FTS" &&
+                        item.content.matched_text.substring(0, 50)}
+                      ...
+                    </span>
+                  </AccordionTrigger>
+                  <AccordionContent>
+                    {item.type === "OCR" && (
+                      <>
+                        <p className="mt-2">{item.content.text}</p>
+                        <div className="flex justify-center mt-4">
+                          <VideoComponent filePath={item.content.file_path} />
+                        </div>
+                        {includeFrames && item.content.frame && (
+                          <div className="mt-2 flex items-center">
+                            <Dialog>
+                              <DialogTrigger asChild>
+                                <img
+                                  src={`data:image/jpeg;base64,${item.content.frame}`}
+                                  alt="Frame"
+                                  className="w-24 h-auto cursor-pointer"
+                                />
+                              </DialogTrigger>
+                              <DialogContent className="sm:max-w-[80vw]">
+                                <img
+                                  src={`data:image/jpeg;base64,${item.content.frame}`}
+                                  alt="Frame"
+                                  className="w-full h-auto"
+                                />
+                              </DialogContent>
+                            </Dialog>
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <HelpCircle className="h-4 w-4 text-gray-400 ml-2 cursor-help" />
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  <p>
+                                    this is the frame where the text appeared
+                                  </p>
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {item.type === "Audio" && (
+                      <>
+                        <p className="mt-2">{item.content.transcription}</p>
+                        <div className="flex justify-center mt-4">
+                          <VideoComponent filePath={item.content.file_path} />
+                        </div>
+                      </>
+                    )}
+                    {item.type === "FTS" && (
+                      <>
+                        <p className="mt-2">{item.content.matched_text}</p>
+                        {item.content.original_frame_text && (
+                          <p className="mt-2 text-sm text-gray-600">
+                            Original: {item.content.original_frame_text}
+                          </p>
+                        )}
+                      </>
+                    )}
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
+              <div className="flex flex-wrap items-center gap-2 mt-2">
+                <p className="text-xs text-gray-400">
+                  {new Date(item.content.timestamp).toLocaleString()}{" "}
+                  {/* Display local time */}
+                </p>
+                {item.type === "OCR" && item.content.app_name && (
+                  <Badge
+                    className="text-xs cursor-pointer"
+                    onClick={() =>
+                      handleBadgeClick(item.content.app_name, "app")
+                    }
+                  >
+                    {item.content.app_name}
+                  </Badge>
+                )}
+                {item.type === "OCR" && item.content.window_name && (
+                  <Badge
+                    className="text-xs cursor-pointer"
+                    onClick={() =>
+                      handleBadgeClick(item.content.window_name, "window")
+                    }
+                  >
+                    {item.content.window_name}
+                  </Badge>
+                )}
+                {item.content.tags &&
+                  item.content.tags.map((tag, index) => (
+                    <Badge key={index} className="text-xs">
+                      {tag}
+                    </Badge>
+                  ))}
+              </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+      ));
   };
 
   return (
     <div className="w-full max-w-4xl mx-auto p-4">
-      
       <div className="grid grid-cols-2 gap-4 mb-4">
         <div className="space-y-2">
           <div className="flex items-center space-x-2">
@@ -486,7 +685,7 @@ export function SearchChat() {
             <Input
               id="search-query"
               type="text"
-              placeholder="search your data..."
+              placeholder="one keyword matching audio transcription or screen text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               autoCorrect="off"
@@ -503,7 +702,10 @@ export function SearchChat() {
                   <HelpCircle className="h-4 w-4 text-gray-400" />
                 </TooltipTrigger>
                 <TooltipContent>
-                  <p>select the type of content to search.</p>
+                  <p>
+                    select the type of content to search. ocr is the text found
+                    on your screen.
+                  </p>
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
@@ -531,7 +733,7 @@ export function SearchChat() {
         </div>
         <div className="space-y-2">
           <div className="flex items-center space-x-2">
-            <Label htmlFor="start-date">start date</Label>
+            <Label htmlFor="start-date">start date (local time)</Label>
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -553,7 +755,7 @@ export function SearchChat() {
         </div>
         <div className="space-y-2">
           <div className="flex items-center space-x-2">
-            <Label htmlFor="end-date">end date</Label>
+            <Label htmlFor="end-date">end date (local time)</Label>
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -574,71 +776,34 @@ export function SearchChat() {
           </div>
         </div>
         <div className="space-y-2">
-          <div className="flex items-center space-x-2">
-            <Label htmlFor="app-name">app name</Label>
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <HelpCircle className="h-4 w-4 text-gray-400" />
-                </TooltipTrigger>
-                <TooltipContent>
-                  <p>
-                    enter the name of the app to search for content for example
-                    zoom, notion, etc. only works for ocr.
-                  </p>
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-          </div>
-          <div className="relative">
-            <Laptop
-              className="absolute left-2 top-1/2 transform -translate-y-1/2 text-gray-400"
-              size={18}
-            />
-            <Input
-              id="app-name"
-              type="text"
-              placeholder="app name"
-              value={appName}
-              onChange={(e) => setAppName(e.target.value)}
-              autoCorrect="off"
-              className="pl-8"
-            />
-          </div>
+          <SqlAutocompleteInput
+            id="app-name"
+            placeholder="app name"
+            value={appName}
+            onChange={setAppName}
+            type="app"
+            icon={
+              <Laptop
+                className="absolute left-2 top-1/2 transform -translate-y-1/2 text-gray-400"
+                size={18}
+              />
+            }
+          />
         </div>
         <div className="space-y-2">
-          <div className="flex items-center space-x-2">
-            <Label htmlFor="window-name">window name</Label>
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <HelpCircle className="h-4 w-4 text-gray-400" />
-                </TooltipTrigger>
-                <TooltipContent>
-                  <p>
-                    enter the name of the window or tab to search for content.
-                    can be a browser tab name, app tab name, etc. only works for
-                    ocr.
-                  </p>
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-          </div>
-          <div className="relative">
-            <Layout
-              className="absolute left-2 top-1/2 transform -translate-y-1/2 text-gray-400"
-              size={18}
-            />
-            <Input
-              id="window-name"
-              type="text"
-              placeholder="window name"
-              value={windowName}
-              onChange={(e) => setWindowName(e.target.value)}
-              autoCorrect="off"
-              className="pl-8"
-            />
-          </div>
+          <SqlAutocompleteInput
+            id="window-name"
+            placeholder="window name"
+            value={windowName}
+            onChange={setWindowName}
+            type="window"
+            icon={
+              <Layout
+                className="absolute left-2 top-1/2 transform -translate-y-1/2 text-gray-400"
+                size={18}
+              />
+            }
+          />
         </div>
         <div className="flex items-center space-x-2">
           <Switch
@@ -655,8 +820,9 @@ export function SearchChat() {
               </TooltipTrigger>
               <TooltipContent>
                 <p>
-                  include frames in the search results. this will only show
-                  frames for ocr. this slows down the search.
+                  include frames in the search results. this shows the frame
+                  where the text appeared. only works for ocr. this may slow
+                  down the search.
                 </p>
               </TooltipContent>
             </Tooltip>
@@ -673,7 +839,9 @@ export function SearchChat() {
                 <TooltipContent>
                   <p>
                     select the number of results to display. usually ai cannot
-                    ingest more than 30 results at a time.
+                    ingest more than 30 OCR results at a time
+                    <br />
+                    and 1000 audio results at a time.
                   </p>
                 </TooltipContent>
               </Tooltip>
@@ -683,9 +851,9 @@ export function SearchChat() {
             id="limit-slider"
             value={[limit]}
             onValueChange={(value: number[]) => setLimit(value[0])}
-            min={1}
-            max={100}
-            step={1}
+            min={10}
+            max={150}
+            step={5}
           />
         </div>
         <div className="space-y-2">
@@ -749,23 +917,62 @@ export function SearchChat() {
           </div>
         </div>
       </div>
-      <Button
-        onClick={() => handleSearch(0)}
-        disabled={isLoading}
-        className="w-full mb-4"
-      >
-        {isLoading ? (
-          <>
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            searching... {progress.toFixed(0)}%
-          </>
-        ) : (
-          "search"
-        )}
-      </Button>
+      <div className="flex justify-between items-center mb-4">
+        <Button
+          onClick={() => handleSearch(0)}
+          disabled={isLoading}
+          className="w-full mr-4"
+        >
+          {isLoading ? (
+            <>
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              searching... {progress.toFixed(0)}%
+            </>
+          ) : (
+            "search"
+          )}
+        </Button>
+        <Dialog open={isCurlDialogOpen} onOpenChange={setIsCurlDialogOpen}>
+          <DialogTrigger asChild>
+            <Button variant="outline" size="icon">
+              <IconCode className="h-4 w-4" />
+            </Button>
+          </DialogTrigger>
+          <DialogContent className="max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>curl command</DialogTitle>
+              <DialogDescription>
+                you can use this curl command to make the same search request
+                from the command line.
+                <br />
+                <br />
+                <span className="text-xs text-gray-500">
+                  note: you need to have `jq` installed to use the command.
+                </span>{" "}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="overflow-x-auto">
+              <CodeBlock language="bash" value={generateCurlCommand()} />
+            </div>
+          </DialogContent>
+        </Dialog>
+      </div>
+      {showExamples && results.length === 0 && (
+        <ExampleSearchCards onSelect={handleExampleSelect} />
+      )}
       {isLoading && (
-        <div className="mt-2">
+        <div className="my-2">
           <Progress value={progress} className="w-full" />
+        </div>
+      )}
+      {results.length > 0 && (
+        <div className="flex items-center space-x-2 mb-4 my-8">
+          <Checkbox
+            id="select-all"
+            checked={selectAll}
+            onCheckedChange={handleSelectAll}
+          />
+          <Label htmlFor="select-all">select all results</Label>
         </div>
       )}
       <div className="space-y-4">
@@ -814,37 +1021,42 @@ export function SearchChat() {
                   type="text"
                   placeholder="ask a question about the results..."
                   value={floatingInput}
-                  disabled={isAiLoading}
+                  disabled={
+                    calculateSelectedContentLength() > MAX_CONTENT_LENGTH
+                  }
                   onChange={(e) => setFloatingInput(e.target.value)}
-                  className="w-full h-12 focus:outline-none focus:ring-0 border-0 focus:border-black focus:border transition-all duration-200 pr-10"
+                  className="w-full h-12 focus:outline-none focus:ring-0 border-0 focus:border-black focus:border-b transition-all duration-200 pr-10"
                 />
-                {calculateTotalContentLength(results) > MAX_CONTENT_LENGTH && (
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <div className="absolute right-3 top-1/2 -translate-y-1/2">
-                          <AlertCircle className="h-5 w-5 text-yellow-500" />
-                        </div>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        <p>
-                          content exceeds 30k tokens. refine your search for
-                          better results.
-                        </p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                )}
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <div className="absolute right-3 top-1/2 -translate-y-1/2">
+                        <ContextUsageIndicator
+                          currentSize={calculateSelectedContentLength()}
+                          maxSize={MAX_CONTENT_LENGTH}
+                        />
+                      </div>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>
+                        {calculateSelectedContentLength() > MAX_CONTENT_LENGTH
+                          ? `selected content exceeds maximum allowed: ${calculateSelectedContentLength()} / ${MAX_CONTENT_LENGTH} characters. unselect some items to use AI.`
+                          : `${calculateSelectedContentLength()} / ${MAX_CONTENT_LENGTH} characters used for AI message`}
+                      </p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
               </div>
               <Button
                 type="submit"
-                className="w-12"
-                disabled={
-                  isAiLoading ||
-                  calculateTotalContentLength(results) > MAX_CONTENT_LENGTH
-                }
+                className={`w-12 `}
+                disabled={calculateSelectedContentLength() > MAX_CONTENT_LENGTH}
               >
-                <Send className="h-4 w-4" />
+                {isStreaming ? (
+                  <Square className="h-4 w-4" />
+                ) : (
+                  <Send className="h-4 w-4" />
+                )}
               </Button>
             </form>
           </motion.div>
@@ -870,7 +1082,7 @@ export function SearchChat() {
           <ChevronDown className="h-6 w-6" />
         </Button>
       )}
-      <div className="h-24" />
+      {results.length > 0 && <div className="h-24" />}
     </div>
   );
 }

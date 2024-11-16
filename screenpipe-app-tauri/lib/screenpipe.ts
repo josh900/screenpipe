@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { encode } from "./utils";
 
 // Define types based on the server's schema
 export type OCRContent = {
@@ -20,6 +21,8 @@ export type AudioContent = {
   file_path: string;
   offset_index: number;
   tags: string[];
+  device_name: string;
+  device_type: string;
 };
 
 export type FTSContent = {
@@ -113,6 +116,14 @@ export const screenpipeQuery = z.object({
     .boolean()
     .default(false)
     .describe("Include frames in the response"),
+  min_length: z
+    .number()
+    .default(50)
+    .describe("Minimum length of the text to include in the response"),
+  max_length: z
+    .number()
+    .default(10000)
+    .describe("Maximum length of the text to include in the response"),
 });
 
 export const screenpipeMultiQuery = z.object({
@@ -135,44 +146,37 @@ export async function queryScreenpipe(
 ): Promise<ScreenpipeResponse | null> {
   try {
     console.log("params", params);
-    const queryParams = new URLSearchParams(
-      Object.entries({
-        q: params.q,
-        offset: params.offset.toString(),
-        limit: params.limit.toString(),
-        start_time: params.start_time,
-        end_time: params.end_time,
-        content_type: params.content_type,
-        app_name: params.app_name,
-        window_name: params.window_name, // Add window_name to query parameters
-      }).filter(([_, v]) => v != null) as [string, string][]
-    );
-    console.log("calling screenpipe", JSON.stringify(params));
-    const response = await fetch(`http://localhost:3030/search?${queryParams}`);
+
+    const queryParams = new URLSearchParams({
+      content_type: params.content_type,
+      limit: params.limit.toString(),
+      offset: params.offset.toString(),
+      start_time: params.start_time,
+      end_time: params.end_time,
+      min_length: params.min_length.toString(),
+      max_length: params.max_length.toString(),
+      include_frames: params.include_frames.toString(),
+    });
+
+    if (params.q) queryParams.append("q", params.q);
+    if (params.app_name) queryParams.append("app_name", params.app_name);
+    if (params.window_name)
+      queryParams.append("window_name", params.window_name);
+
+    const url = `http://localhost:3030/search?${queryParams.toString()}`;
+    console.log("calling screenpipe", url);
+
+    const response = await fetch(url);
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`HTTP error! status: ${response.status} ${text}`);
+      throw new Error(`http error! status: ${response.status} ${text}`);
     }
     const result = await response.json();
-    // remove all elements with empty text
-    // const resultWithNoEmptyText = {
-    //   ...result,
-    //   data: result.data.filter(
-    //     (element: any) =>
-    //       (element.content?.text !== undefined &&
-    //         element.content?.text !== null &&
-    //         element.content?.text?.length > 100) ||
-    //       // same for .transcription
-    //       (element.content?.transcription !== undefined &&
-    //         element.content?.transcription !== null &&
-    //         element.content?.transcription?.length > 10)
-    //   ),
-    // };
     console.log("result", result);
     console.log("result", result.data.length);
     return result;
   } catch (error) {
-    console.error("Error querying screenpipe:", error);
+    console.error("error querying screenpipe:", error);
     return null;
   }
 }
