@@ -332,7 +332,7 @@ const DevModeSettings = () => {
   );
 };
 
-export function HealthStatus({ className }: { className?: string }) {
+const HealthStatus = ({ className }: { className?: string }) => {
   const { health } = useHealthCheck();
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isMac, setIsMac] = useState(false);
@@ -340,17 +340,7 @@ export function HealthStatus({ className }: { className?: string }) {
   const [isLogOpen, setIsLogOpen] = useState(false);
 
   useEffect(() => {
-    const checkPlatform = async () => {
-      try {
-        const currentPlatform = await platform();
-        setIsMac(currentPlatform === "macos");
-      } catch (error) {
-        console.error("Failed to detect platform:", error);
-        setIsMac(false);
-      }
-    };
-
-    checkPlatform();
+    setIsMac(platform() === "macos");
   }, []);
 
   const handleResetScreenPermissions = async () => {
@@ -592,6 +582,6 @@ export function HealthStatus({ className }: { className?: string }) {
       </Dialog>
     </>
   );
-}
+};
 
 export default HealthStatus;
