@@ -1,14 +1,14 @@
 #[cfg(feature = "pipes")]
 #[cfg(test)]
 mod tests {
-    use screenpipe_core::{download_pipe, run_js, run_pipe};
+    use reqwest;
+    use screenpipe_core::{download_pipe, run_pipe};
     use serde_json::json;
+    use std::time::Duration;
     use std::{path::PathBuf, sync::Once};
     use tempfile::TempDir;
-    use tokio::{
-        fs::{create_dir_all, File},
-        io::AsyncWriteExt,
-    };
+    use tokio::fs::create_dir_all;
+    use tokio::time::sleep;
     use tracing::subscriber::set_global_default;
     use tracing_subscriber::fmt::Subscriber;
 
@@ -22,35 +22,6 @@ mod tests {
                 .finish();
             set_global_default(subscriber).expect("Failed to set tracing subscriber");
         });
-    }
-    #[tokio::test]
-    #[ignore]
-    async fn test_js_execution() {
-        init();
-        let code = r#"
-            function add(a, b) {
-                return a + b;
-            }
-            add(2, 3);
-            console.log("Hello, world!");
-            const response = await pipe.get("https://jsonplaceholder.typicode.com/todos/1");
-            console.log(response);
-            "#;
-
-        // write code to a file
-        let file_path = "test.js";
-        let mut file = File::create(file_path).await.unwrap();
-        file.write_all(code.as_bytes()).await.unwrap();
-        file.flush().await.unwrap();
-        // Test a simple JavaScript function
-        let temp_dir = TempDir::new().unwrap();
-        let screenpipe_dir = temp_dir.path().to_path_buf();
-
-        let result = run_js("", file_path, screenpipe_dir).await;
-
-        assert!(result.is_ok());
-        println!("result: {:?}", result);
-        // remove_file(file_path).await.unwrap();
     }
 
     async fn setup_test_pipe(temp_dir: &TempDir, pipe_name: &str, code: &str) -> PathBuf {
@@ -76,7 +47,7 @@ mod tests {
 
         let pipe_dir = setup_test_pipe(&temp_dir, "simple_pipe", code).await;
 
-        let result = run_pipe(pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
+        let result = run_pipe(&pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
         assert!(result.is_ok());
     }
 
@@ -94,7 +65,7 @@ mod tests {
 
         let pipe_dir = setup_test_pipe(&temp_dir, "http_pipe", code).await;
 
-        let result = run_pipe(pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
+        let result = run_pipe(&pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
         assert!(result.is_ok());
     }
 
@@ -111,7 +82,7 @@ mod tests {
 
         let pipe_dir = setup_test_pipe(&temp_dir, "error_pipe", code).await;
 
-        let result = run_pipe(pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
+        let result = run_pipe(&pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
         assert!(result.is_err());
     }
 
@@ -130,7 +101,7 @@ mod tests {
 
         let pipe_dir = setup_test_pipe(&temp_dir, "file_pipe", code).await;
 
-        let result = run_pipe(pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
+        let result = run_pipe(&pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
         assert!(result.is_ok());
 
         // Verify that the file was created and contains the expected content
@@ -147,7 +118,7 @@ mod tests {
         config: &str,
     ) -> PathBuf {
         init();
-        let pipe_dir = temp_dir.path().join(pipe_name);
+        let pipe_dir = temp_dir.path().join("pipes").join(pipe_name);
         create_dir_all(&pipe_dir).await.unwrap();
 
         let ts_file_path = pipe_dir.join("pipe.ts");
@@ -187,7 +158,7 @@ mod tests {
         // Change the working directory to the pipe directory
         std::env::set_current_dir(&pipe_dir).unwrap();
 
-        let result = run_pipe(pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
+        let result = run_pipe("config_pipe", screenpipe_dir).await;
         assert!(result.is_ok(), "Pipe execution failed: {:?}", result);
     }
 
@@ -231,5 +202,244 @@ mod tests {
         let result = download_pipe(invalid_url, screenpipe_dir.clone()).await;
 
         assert!(result.is_err(), "Expected an error for invalid URL");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_send_email() {
+        let temp_dir = TempDir::new().unwrap();
+        let screenpipe_dir = temp_dir.path().to_path_buf();
+        let to = std::env::var("EMAIL_TO").expect("EMAIL_TO not set");
+        let from = std::env::var("EMAIL_FROM").expect("EMAIL_FROM not set");
+        let password = std::env::var("EMAIL_PASSWORD").expect("EMAIL_PASSWORD not set");
+
+        println!("to: {}", to);
+        println!("from: {}", from);
+        println!("password: {}", password);
+
+        // Test plain text email
+        let plain_text_code = format!(
+            r#"
+            (async () => {{
+                const result = await pipe.sendEmail({{
+                    to: "{to}",
+                    from: "{from}",
+                    password: "{password}",
+                    subject: "screenpipe test - plain text",
+                    body: "yo louis, this is a plain text email test!",
+                    contentType: "text/plain"
+                }});
+                console.log("Plain text email result:", result);
+                if (!result) {{
+                    throw new Error("Failed to send plain text email");
+                }}
+            }})();
+            "#
+        );
+
+        // Test HTML email
+        let html_code = format!(
+            r#"
+            (async () => {{
+                const result = await pipe.sendEmail({{
+                    to: "{to}",
+                    from: "{from}",
+                    password: "{password}",
+                    subject: "screenpipe test - html",
+                    body: `
+                        <html>
+                            <body>
+                                <h1>yo louis, you absolute madlad!</h1>
+                                <p>this is an <strong>html</strong> email test from screenpipe.</p>
+                                <ul>
+                                    <li>item 1</li>
+                                    <li>item 2</li>
+                                    <li>item 3</li>
+                                </ul>
+                            </body>
+                        </html>
+                    `,
+                    contentType: "text/html"
+                }});
+                console.log("HTML email result:", result);
+                if (!result) {{
+                    throw new Error("Failed to send HTML email");
+                }}
+            }})();
+            "#
+        );
+
+        let pipe_dir = setup_test_pipe(&temp_dir, "email_test_pipe_plain", &plain_text_code).await;
+        std::env::set_current_dir(&pipe_dir).unwrap();
+        let result = run_pipe(
+            &pipe_dir.to_string_lossy().to_string(),
+            screenpipe_dir.clone(),
+        )
+        .await;
+        assert!(result.is_ok(), "Plain text email test failed: {:?}", result);
+
+        let pipe_dir = setup_test_pipe(&temp_dir, "email_test_pipe_html", &html_code).await;
+        std::env::set_current_dir(&pipe_dir).unwrap();
+        let result = run_pipe(&pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
+        assert!(result.is_ok(), "HTML email test failed: {:?}", result);
+    }
+
+    #[tokio::test]
+    #[ignore] // works when run on click in cursor but not in cli so weird haha
+    async fn test_directory_functions() {
+        let temp_dir = TempDir::new().unwrap();
+        let screenpipe_dir = temp_dir.path().to_path_buf();
+
+        let code = r#"
+        (async () => {
+            // Test mkdir
+            await fs.mkdir('test_dir');
+            console.log('Directory created');
+
+            // Test writeFile
+            await fs.writeFile('test_dir/test_file.txt', 'Hello, World!');
+            console.log('File written');
+
+            // Test readFile
+            const content = await fs.readFile('test_dir/test_file.txt');
+            console.log('File content:', content);
+            if (content !== 'Hello, World!') {
+                throw new Error('File content mismatch');
+            }
+
+            // Test readdir
+            const files = await fs.readdir('test_dir');
+            console.log('Directory contents:', files);
+            if (!files.includes('test_file.txt')) {
+                throw new Error('File not found in directory');
+            }
+
+            // Test path.join
+            const joinedPath = path.join('test_dir', 'nested', 'file.txt');
+            console.log('Joined path:', joinedPath);
+            const expectedPath = process.env.OS === 'windows' ? 'test_dir\\nested\\file.txt' : 'test_dir/nested/file.txt';
+            if (joinedPath !== expectedPath) {
+                throw new Error('Path join mismatch');
+            }
+
+            console.log('All directory function tests passed');
+        })();
+        "#;
+
+        let pipe_dir = setup_test_pipe(&temp_dir, "directory_functions_test", code).await;
+
+        // Change the working directory to the pipe directory
+        std::env::set_current_dir(&pipe_dir).unwrap();
+
+        let result = run_pipe(&pipe_dir.to_string_lossy().to_string(), screenpipe_dir).await;
+        assert!(result.is_ok(), "Pipe execution failed: {:?}", result);
+
+        // Additional checks
+        let test_dir = pipe_dir.join("test_dir");
+        assert!(test_dir.exists(), "Test directory was not created");
+
+        let test_file = test_dir.join("test_file.txt");
+        assert!(test_file.exists(), "Test file was not created");
+
+        let file_content = std::fs::read_to_string(test_file).unwrap();
+        assert_eq!(file_content, "Hello, World!", "File content mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_nextjs_pipe_app_dir() {
+        println!("Starting test_nextjs_pipe_app_dir");
+        init();
+        let temp_dir = TempDir::new().unwrap();
+        let screenpipe_dir = temp_dir.path().to_path_buf();
+        println!("Temp dir created: {:?}", temp_dir.path());
+
+        // Set up a minimal Next.js project structure with App Router
+        let nextjs_pipe_dir = temp_dir.path().join("pipes").join("nextjs-test-pipe");
+        tokio::fs::create_dir_all(&nextjs_pipe_dir).await.unwrap();
+        println!("Next.js pipe directory created: {:?}", nextjs_pipe_dir);
+
+        // Create package.json
+        let package_json = r#"{
+            "name": "nextjs-test-pipe",
+            "version": "1.0.0",
+            "dependencies": {
+                "next": "latest",
+                "react": "latest",
+                "react-dom": "latest"
+            },
+            "scripts": {
+                "dev": "next dev",
+                "build": "next build",
+                "start": "next start -p 3000"
+            }
+        }"#;
+        tokio::fs::write(nextjs_pipe_dir.join("package.json"), package_json)
+            .await
+            .unwrap();
+        println!("package.json created");
+
+        // Create app directory and a simple page.tsx
+        let app_dir = nextjs_pipe_dir.join("app");
+        tokio::fs::create_dir_all(&app_dir).await.unwrap();
+        let page_tsx = r#"
+            export default function Home() {
+                return <h1>Hello from Next.js App Router pipe!</h1>
+            }
+        "#;
+        tokio::fs::write(app_dir.join("page.tsx"), page_tsx)
+            .await
+            .unwrap();
+
+        // Create layout.tsx
+        let layout_tsx = r#"
+            export default function RootLayout({
+                children,
+            }: {
+                children: React.ReactNode
+            }) {
+                return (
+                    <html lang="en">
+                        <body>{children}</body>
+                    </html>
+                )
+            }
+        "#;
+        tokio::fs::write(app_dir.join("layout.tsx"), layout_tsx)
+            .await
+            .unwrap();
+
+        // Create pipe.json
+        let pipe_json = r#"{
+            "is_nextjs": true
+        }"#;
+        tokio::fs::write(nextjs_pipe_dir.join("pipe.json"), pipe_json)
+            .await
+            .unwrap();
+
+        // Run the pipe in a separate task
+        let pipe_task = tokio::spawn(run_pipe("nextjs-test-pipe", screenpipe_dir.clone()));
+
+        // Wait for a short time to allow the server to start
+        sleep(Duration::from_secs(10)).await;
+
+        // Check if the server is running
+        let client = reqwest::Client::new();
+        let response = client.get("http://localhost:3000").send().await;
+
+        assert!(response.is_ok(), "Failed to connect to Next.js server");
+        let response = response.unwrap();
+        assert!(response.status().is_success(), "HTTP request failed");
+
+        let body = response.text().await.expect("Failed to get response body");
+        println!("Response body: {}", body);
+        assert!(
+            body.contains("Generated by create next app"),
+            "Unexpected response content"
+        );
+
+        // Clean up: cancel the pipe task
+        pipe_task.abort();
+
+        println!("Test completed successfully");
     }
 }

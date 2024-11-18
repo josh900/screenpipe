@@ -1,20 +1,21 @@
 class Screenpipe < Formula
   desc "Library to build personalized AI powered by what you've seen, said, or heard."
   homepage "https://github.com/mediar-ai/screenpipe"
-  url "https://github.com/mediar-ai/screenpipe/releases/download/v0.1.90/screenpipe-0.1.90-aarch64-apple-darwin.tar.gz"
-  version "0.1.90"
+  url "https://github.com/mediar-ai/screenpipe/releases/download/v0.1.98/screenpipe-0.1.98-aarch64-apple-darwin.tar.gz"
+  version "0.1.98"
 
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/mediar-ai/screenpipe/releases/download/v#{version}/screenpipe-#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "3b4a1012341b60806eb403d8c5c36365540dc80b53ef595226f2d73689debf88" # arm64
+      sha256 "2cb4d60689ee22bf7c639e75cbcb57d3b8f21732fc383ff57592b4044b5e4396" # arm64
     else
       url "https://github.com/mediar-ai/screenpipe/releases/download/v#{version}/screenpipe-#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "23add0dbfd536f0904ed6973d03b585a8bc1cf540fe78c1055900587c5c7e213" # x86_64
+      sha256 "969dad8fdbf79af2fa6ea14b604ac656041d8fa0281777b70bac6893d13bd34b" # x86_64
     end
   end
   
   depends_on "ffmpeg"
+  # depends_on "bun" # not available on brew?
 
   def install
     bin.install Dir["bin/*"]

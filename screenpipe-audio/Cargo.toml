@@ -13,6 +13,7 @@ edition = { workspace = true }
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tar = "=0.4.42"
 
 # Cross-platform audio capture
 # cpal = "0.15.2"
@@ -66,8 +67,21 @@ screenpipe-core = { path = "../screenpipe-core" }
 # crossbeam
 crossbeam = { workspace = true }
 
+# Directories
+dirs = "5.0.1"
+
+lazy_static = { version = "1.4.0" }
+realfft = "3.4.0"
+regex = "1.11.0"
+
+
 [target.'cfg(target_os = "windows")'.dependencies]
-ort = { version = "2.0.0-rc.5", features = ["download-binaries", "copy-dylibs", "directml", "cuda"] }
+ort = { version = "2.0.0-rc.5", features = [
+  "download-binaries",
+  "copy-dylibs",
+  "directml",
+  "cuda",
+] }
 esaxx-rs = "0.1.10"
 samplerate = { version = "0.2.4" }
 libsamplerate-sys = "0.1.10"
@@ -81,7 +95,9 @@ tempfile = "3.3.0"
 infer = "0.15"
 criterion = { workspace = true }
 memory-stats = "1.0"
-
+strsim = "0.10.0"
+futures = "0.3.31"
+tracing-subscriber = "0.3.16"
 [features]
 metal = ["candle/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
@@ -98,8 +114,3 @@ harness = false
 [[bench]]
 name = "record_and_transcribe_benchmark"
 harness = false
-
-[[bench]]
-name = "stt_benchmark"
-harness = false
-

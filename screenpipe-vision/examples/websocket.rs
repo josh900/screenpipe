@@ -7,6 +7,7 @@ use screenpipe_vision::{
     continuous_capture, monitor::get_default_monitor, CaptureResult, OcrEngine,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -22,10 +23,11 @@ struct SimplifiedResult {
 
 #[derive(Clone, Serialize)]
 pub struct SimplifiedWindowResult {
-    pub image: String, // Changed to String to store base64-encoded image
+    // pub image: String,
     pub window_name: String,
     pub app_name: String,
     pub text: String,
+    pub text_json: Vec<HashMap<String, String>>, // Change this line
     pub focused: bool,
     pub confidence: f64,
 }
@@ -37,13 +39,26 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     save_text_files: bool,
 
-    /// FPS
-    #[arg(long, default_value_t = 1.0)]
-    fps: f32,
+    /// FPS for continuous recording
+    /// 1 FPS = 30 GB / month
+    /// 5 FPS = 150 GB / month
+    /// Optimise based on your needs.
+    /// Your screen rarely change more than 1 times within a second, right?
+    #[cfg_attr(not(target_os = "macos"), arg(short, long, default_value_t = 1.0))]
+    #[cfg_attr(target_os = "macos", arg(short, long, default_value_t = 0.2))]
+    fps: f64,
 
     /// WebSocket port
     #[arg(long, default_value_t = 8080)]
     ws_port: u16,
+
+    /// List of windows to ignore (by title) for screen recording
+    #[arg(long)]
+    ignored_windows: Vec<String>,
+
+    /// List of windows to include (by title) for screen recording
+    #[arg(long)]
+    included_windows: Vec<String>,
 }
 
 #[tokio::main]
@@ -70,7 +85,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         continuous_capture(
             result_tx,
-            Duration::from_secs_f32(1.0 / cli.fps),
+            Duration::from_secs_f64(1.0 / cli.fps),
             save_text_files,
             // if apple use apple otherwise if windows use windows native otherwise use tesseract
             if cfg!(target_os = "macos") {
@@ -81,8 +96,9 @@ async fn main() -> Result<()> {
                 OcrEngine::Tesseract
             },
             id,
-            &[],
-            &[],
+            &cli.ignored_windows,
+            &cli.included_windows,
+            vec![],
         )
         .await
     });
@@ -102,9 +118,9 @@ async fn run_websocket_server(
 ) -> Result<()> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
-    println!("WebSocket server listening on: {}", addr);
+    println!("websocket server listening on: {}", addr);
 
-    let (tx, _) = tokio::sync::broadcast::channel::<SimplifiedResult>(512);
+    let (tx, _) = tokio::sync::broadcast::channel::<SimplifiedResult>(2);
     let tx = Arc::new(tx);
 
     let tx_clone = tx.clone();
@@ -125,13 +141,14 @@ async fn run_websocket_server(
                                 window.image.color().into(),
                             )
                             .expect("Failed to encode image");
-                        let base64_image = general_purpose::STANDARD.encode(buffer);
+                        let _base64_image = general_purpose::STANDARD.encode(buffer);
 
                         SimplifiedWindowResult {
-                            image: base64_image,
+                            // image: base64_image,
                             window_name: window.window_name,
                             app_name: window.app_name,
                             text: window.text,
+                            text_json: window.text_json, // Add this line
                             focused: window.focused,
                             confidence: window.confidence,
                         }
@@ -140,6 +157,9 @@ async fn run_websocket_server(
                 timestamp: result.timestamp.elapsed().as_secs(),
             };
             let _ = tx_clone.send(simplified);
+
+            // resubscribe to get only the latest message
+            let _ = tx_clone.subscribe().resubscribe();
         }
     });
 

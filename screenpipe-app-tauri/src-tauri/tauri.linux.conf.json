@@ -1,15 +1,19 @@
 {
     "bundle": {
         "externalBin": [
-            "screenpipe"
+            "screenpipe",
+            "bun",
+            "ollama"
+        ],
+        "resources": [
+            "lib/ollama/*"
         ],
         "linux": {
             "deb": {
                 "depends": [
                     "tesseract-ocr",
                     "libtesseract-dev",
-                    "ffmpeg",
-                    "libopenblas-dev"
+                    "ffmpeg"
                 ]
             }
         }

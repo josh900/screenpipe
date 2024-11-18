@@ -1,489 +1,411 @@
 #[allow(clippy::module_inception)]
 #[cfg(feature = "pipes")]
 mod pipes {
-    use deno_ast::MediaType;
-    use deno_ast::ParseParams;
-    use deno_ast::SourceTextInfo;
-    use deno_core::error::AnyError;
-    use deno_core::extension;
-    use deno_core::op2;
-    use deno_core::ModuleLoadResponse;
-    use deno_core::ModuleSourceCode;
     use regex::Regex;
-    use reqwest::header::HeaderMap;
-    use reqwest::header::HeaderValue;
-    use reqwest::header::CONTENT_TYPE;
-    use std::collections::HashMap;
-    use std::env;
+    use std::future::Future;
     use std::path::PathBuf;
-    use std::rc::Rc;
-    use tracing::debug;
+    use std::pin::Pin;
+    use tokio::process::Command;
 
     use reqwest::Client;
     use serde_json::Value;
 
+    use anyhow::Result;
     use reqwest;
+    use std::fs;
     use std::path::Path;
-    use tracing::{error, info};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tracing::{debug, error, info};
     use url::Url;
+    use which::which;
 
-    // Add this function near the top of the file, after the imports
+    // Add these imports at the top of the file
+    use serde_json::json;
+    use tokio::fs::File;
+    use tokio::io::AsyncWriteExt;
+
+    use crate::pick_unused_port;
+
+    // Update this function near the top of the file
     fn sanitize_pipe_name(name: &str) -> String {
         let re = Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
-        re.replace_all(name, "-").to_string()
+        let sanitized = re.replace_all(name, "-").to_string();
+
+        // Remove "-ref-main/" suffix if it exists
+        sanitized
+            .strip_suffix("-ref-main/")
+            .or_else(|| sanitized.strip_suffix("-ref-main"))
+            .unwrap_or(&sanitized)
+            .to_string()
     }
 
-    #[op2]
-    #[string]
-    fn op_get_env(#[string] key: String) -> Option<String> {
-        env::var(&key).ok()
-    }
+    pub async fn run_pipe(pipe: &str, screenpipe_dir: PathBuf) -> Result<Option<u16>> {
+        let pipe_dir = screenpipe_dir.join("pipes").join(pipe);
+        let pipe_json_path = pipe_dir.join("pipe.json");
 
-    #[op2(async)]
-    #[string]
-    async fn op_fetch(
-        #[string] url: String,
-        #[serde] options: Option<Value>,
-    ) -> anyhow::Result<String, AnyError> {
-        let client = Client::new();
-        let mut request = client.get(&url);
+        // Check if pipe is still enabled
+        if pipe_json_path.exists() {
+            let pipe_json = tokio::fs::read_to_string(&pipe_json_path).await?;
+            let pipe_config: Value = serde_json::from_str(&pipe_json)?;
 
-        if let Some(opts) = options {
-            if let Some(method) = opts.get("method").and_then(|m| m.as_str()) {
-                request = match method.to_uppercase().as_str() {
-                    "GET" => client.get(&url),
-                    "POST" => client.post(&url),
-                    "PUT" => client.put(&url),
-                    "DELETE" => client.delete(&url),
-                    // Add other methods as needed
-                    _ => return Err(anyhow::anyhow!("Unsupported HTTP method")),
-                };
+            if !pipe_config
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                debug!("pipe {} is disabled, stopping", pipe);
+                return Ok(None);
             }
+        }
 
-            if let Some(headers) = opts.get("headers").and_then(|h| h.as_object()) {
-                for (key, value) in headers {
-                    if let Some(value_str) = value.as_str() {
-                        request = request.header(key, value_str);
-                    }
+        // Prepare environment variables
+        let mut env_vars = std::env::vars().collect::<Vec<(String, String)>>();
+        env_vars.push((
+            "SCREENPIPE_DIR".to_string(),
+            screenpipe_dir.to_str().unwrap().to_string(),
+        ));
+        env_vars.push(("PIPE_ID".to_string(), pipe.to_string()));
+        env_vars.push((
+            "PIPE_DIR".to_string(),
+            pipe_dir.to_str().unwrap().to_string(),
+        ));
+
+        if pipe_json_path.exists() {
+            let pipe_json = tokio::fs::read_to_string(&pipe_json_path).await?;
+            let pipe_config: Value = serde_json::from_str(&pipe_json)?;
+
+            if pipe_config["is_nextjs"] == json!(true) {
+                info!("Running Next.js pipe: {}", pipe);
+
+                // Install dependencies using bun
+                info!("Installing dependencies for Next.js pipe");
+                let install_output = Command::new("bun")
+                    .arg("install")
+                    .current_dir(&pipe_dir)
+                    .output()
+                    .await?;
+
+                if !install_output.status.success() {
+                    error!(
+                        "Failed to install dependencies: {}",
+                        String::from_utf8_lossy(&install_output.stderr)
+                    );
+                    anyhow::bail!("Failed to install dependencies for Next.js pipe");
                 }
-            }
 
-            if let Some(body) = opts.get("body").and_then(|b| b.as_str()) {
-                request = request.body(body.to_string());
-            }
-        }
+                let port = pick_unused_port().expect("No ports free");
 
-        let response = match request.send().await {
-            Ok(resp) => resp,
-            Err(e) => return Err(anyhow::anyhow!(e)),
-        };
+                // Update pipe.json with the port
+                let mut updated_config = pipe_config.clone();
+                updated_config["port"] = json!(port);
+                let updated_pipe_json = serde_json::to_string_pretty(&updated_config)?;
+                let mut file = File::create(&pipe_json_path).await?;
+                file.write_all(updated_pipe_json.as_bytes()).await?;
 
-        let status = response.status();
-        let headers = response.headers().clone();
-        let text = match response.text().await {
-            Ok(t) => t,
-            Err(e) => return Err(anyhow::anyhow!(e)),
-        };
+                env_vars.push(("PORT".to_string(), port.to_string()));
 
-        let result = serde_json::json!({
-            "status": status.as_u16(),
-            "statusText": status.to_string(),
-            "headers": headers.iter()
-                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-                .collect::<HashMap<String, String>>(),
-            "text": text,
-        });
+                // Run the Next.js project with bun
+                let mut child = Command::new("bun")
+                    .arg("run")
+                    .arg("dev")
+                    .arg("--port")
+                    .arg(port.to_string())
+                    .current_dir(&pipe_dir)
+                    .envs(env_vars)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()?;
 
-        Ok(result.to_string())
-    }
+                // Stream logs
+                stream_logs(pipe, &mut child).await?;
 
-    #[op2(async)]
-    #[string]
-    async fn op_read_file(#[string] path: String) -> anyhow::Result<String, AnyError> {
-        let current_dir = std::env::current_dir()?;
-        let full_path = current_dir.join(path);
-        tokio::fs::read_to_string(&full_path).await.map_err(|e| {
-            error!("Failed to read file '{}': {}", full_path.display(), e);
-            AnyError::from(e)
-        })
-    }
-
-    #[op2(async)]
-    #[string]
-    async fn op_write_file(
-        #[string] path: String,
-        #[string] contents: String,
-    ) -> anyhow::Result<(), AnyError> {
-        tokio::fs::write(&path, contents).await.map_err(|e| {
-            error!("Failed to write file '{}': {}", path, e);
-            AnyError::from(e)
-        })
-    }
-
-    #[op2(async)]
-    #[string]
-    async fn op_fetch_get(#[string] url: String) -> anyhow::Result<String, AnyError> {
-        let response = reqwest::get(&url).await?;
-        let status = response.status();
-        let text = response.text().await?;
-
-        if !status.is_success() {
-            error!("HTTP error status: {}, text: {}", status, text);
-            return Err(AnyError::msg(format!(
-                "HTTP error status: {}, text: {}",
-                status, text
-            )));
-        }
-
-        Ok(text)
-    }
-
-    #[op2(async)]
-    #[string]
-    async fn op_fetch_post(
-        #[string] url: String,
-        #[string] body: String,
-    ) -> anyhow::Result<String, AnyError> {
-        let client = reqwest::Client::new();
-
-        // Create a HeaderMap and add the Content-Type header
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        let response = client.post(&url).headers(headers).body(body).send().await?;
-
-        let status = response.status();
-        let text = response.text().await?;
-
-        if !status.is_success() {
-            error!("HTTP error status: {}, text: {}", status, text);
-            return Err(AnyError::msg(format!(
-                "HTTP error status: {}, text: {}",
-                status, text
-            )));
-        }
-
-        Ok(text)
-    }
-
-    #[op2(async)]
-    async fn op_set_timeout(delay: f64) -> anyhow::Result<(), AnyError> {
-        tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
-        Ok(())
-    }
-
-    #[op2(fast)]
-    fn op_remove_file(#[string] path: String) -> anyhow::Result<()> {
-        std::fs::remove_file(path)?;
-        Ok(())
-    }
-
-    struct TsModuleLoader;
-
-    impl deno_core::ModuleLoader for TsModuleLoader {
-        fn resolve(
-            &self,
-            specifier: &str,
-            referrer: &str,
-            _kind: deno_core::ResolutionKind,
-        ) -> Result<deno_core::ModuleSpecifier, AnyError> {
-            deno_core::resolve_import(specifier, referrer).map_err(|e| e.into())
-        }
-
-        fn load(
-            &self,
-            module_specifier: &deno_core::ModuleSpecifier,
-            _maybe_referrer: Option<&reqwest::Url>,
-            _is_dyn_import: bool,
-            _requested_module_type: deno_core::RequestedModuleType,
-        ) -> ModuleLoadResponse {
-            let module_specifier = module_specifier.clone();
-
-            let module_load = Box::pin(async move {
-                let path = module_specifier.to_file_path().unwrap();
-
-                let media_type = MediaType::from_path(&path);
-                let (module_type, should_transpile) = match MediaType::from_path(&path) {
-                    MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
-                        (deno_core::ModuleType::JavaScript, false)
-                    }
-                    MediaType::Jsx => (deno_core::ModuleType::JavaScript, true),
-                    MediaType::TypeScript
-                    | MediaType::Mts
-                    | MediaType::Cts
-                    | MediaType::Dts
-                    | MediaType::Dmts
-                    | MediaType::Dcts
-                    | MediaType::Tsx => (deno_core::ModuleType::JavaScript, true),
-                    MediaType::Json => (deno_core::ModuleType::Json, false),
-                    _ => panic!("Unknown extension {:?}", path.extension()),
-                };
-
-                let code = std::fs::read_to_string(&path)?;
-                let code = if should_transpile {
-                    let parsed = deno_ast::parse_module(ParseParams {
-                        specifier: module_specifier.clone(),
-                        text_info: SourceTextInfo::from_string(code),
-                        media_type,
-                        capture_tokens: false,
-                        scope_analysis: false,
-                        maybe_syntax: None,
-                    })?;
-                    parsed
-                        .transpile(&Default::default(), &Default::default())?
-                        .into_source()
-                        .text
-                } else {
-                    code
-                };
-                let module = deno_core::ModuleSource::new(
-                    module_type,
-                    ModuleSourceCode::String(code.into()),
-                    &module_specifier,
-                    None,
-                );
-                Ok(module)
-            });
-
-            ModuleLoadResponse::Async(module_load)
-        }
-    }
-
-    static RUNTIME_SNAPSHOT: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/RUNJS_SNAPSHOT.bin"));
-
-    extension! {
-        runjs,
-        ops = [
-            op_read_file,
-            op_write_file,
-            op_remove_file,
-            op_fetch_get,
-            op_fetch_post,
-            op_set_timeout,
-            op_fetch,
-            op_get_env,
-        ]
-    }
-
-    pub async fn run_js(
-        pipe: &str,
-        file_path: &str,
-        screenpipe_dir: PathBuf,
-    ) -> anyhow::Result<()> {
-        let main_module = deno_core::resolve_path(file_path, env::current_dir()?.as_path())?;
-        let mut js_runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
-            module_loader: Some(Rc::new(TsModuleLoader)),
-            startup_snapshot: Some(RUNTIME_SNAPSHOT),
-            extensions: vec![runjs::init_ops()],
-            ..Default::default()
-        });
-
-        // set some metadata on the runtime
-        js_runtime.execute_script("main", "globalThis.metadata = { }")?;
-        // set the pipe id
-        js_runtime.execute_script("main", format!("globalThis.metadata.id = '{}'", pipe))?;
-
-        // initialize process.env
-        js_runtime.execute_script("main", "globalThis.process = { env: {} }")?;
-
-        for (key, value) in env::vars() {
-            if key.starts_with("SCREENPIPE_") {
-                let escaped_value = value.replace('\\', "\\\\").replace('\"', "\\\"");
-                js_runtime.execute_script(
-                    "main",
-                    format!(
-                        "process.env[{}] = \"{}\";",
-                        serde_json::to_string(&key)?,
-                        escaped_value
-                    ),
-                )?;
+                return Ok(Some(port));
             }
         }
 
-        // set additional environment variables
-        let home_dir = dirs::home_dir().unwrap_or_default();
-        let current_dir = env::current_dir()?;
-        let temp_dir = env::temp_dir();
-
-        js_runtime.execute_script(
-            "main",
-            format!(
-                r#"
-            globalThis.process.env.SCREENPIPE_DIR = "{}";
-            globalThis.process.env.HOME = "{}";
-            globalThis.process.env.CURRENT_DIR = "{}";
-            globalThis.process.env.TEMP_DIR = "{}";
-            globalThis.process.env.PIPE_ID = "{}";
-            globalThis.process.env.PIPE_FILE = "{}";
-            "#,
-                screenpipe_dir
-                    .to_string_lossy()
-                    .replace('\\', "\\\\")
-                    .replace('\"', "\\\""),
-                home_dir
-                    .to_string_lossy()
-                    .replace('\\', "\\\\")
-                    .replace('\"', "\\\""),
-                current_dir
-                    .to_string_lossy()
-                    .replace('\\', "\\\\")
-                    .replace('\"', "\\\""),
-                temp_dir
-                    .to_string_lossy()
-                    .replace('\\', "\\\\")
-                    .replace('\"', "\\\""),
-                pipe.replace('\"', "\\\""),
-                file_path.replace('\\', "\\\\").replace('\"', "\\\"")
-            ),
-        )?;
-
-        let mod_id = js_runtime.load_main_es_module(&main_module).await?;
-        let evaluate_future = js_runtime.mod_evaluate(mod_id);
-
-        // run the event loop and handle potential errors
-        match js_runtime.run_event_loop(Default::default()).await {
-            Ok(_) => (),
-            Err(e) => {
-                error!("error in javascript runtime event loop: {}", e);
-                // you can choose to return the error or handle it differently
-                // return Err(anyhow::anyhow!("javascript runtime error: {}", e));
-            }
-        }
-
-        // evaluate the module and handle potential errors
-        match evaluate_future.await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                error!("error evaluating javascript module: {}", e);
-                // you can choose to return the error or handle it differently
-                Err(anyhow::anyhow!("javascript module evaluation error: {}", e))
-            }
-        }
-    }
-
-    #[allow(clippy::manual_async_fn)]
-    pub async fn run_pipe(pipe: String, screenpipe_dir: PathBuf) -> anyhow::Result<()> {
-        debug!(
-            "Running pipe: {}, screenpipe_dir: {}",
-            pipe,
-            screenpipe_dir.display()
-        );
-
-        let pipe_dir = match Url::parse(&pipe) {
-            Ok(_) => {
-                info!("Input appears to be a URL. Attempting to download...");
-
-                PathBuf::from(&pipe)
-            }
-            Err(_) => {
-                info!("Input appears to be a local path. Attempting to canonicalize...");
-                match screenpipe_dir.join("pipes").join(&pipe).canonicalize() {
-                    Ok(path) => path,
-                    Err(e) => {
-                        error!("Failed to canonicalize path: {}", e);
-                        anyhow::bail!("Failed to canonicalize path: {}", e);
-                    }
-                }
-            }
-        };
-
-        info!("Pipe directory: {:?}", pipe_dir);
-
+        // If it's not a Next.js project, run the pipe as before
         let main_module = find_pipe_file(&pipe_dir)?;
 
-        match run_js(&pipe, &main_module.to_string_lossy(), screenpipe_dir).await {
-            Ok(_) => info!("JS execution completed successfully"),
-            Err(error) => {
-                error!("Error during JS execution: {}", error);
-                anyhow::bail!("Error during JS execution: {}", error);
+        info!("executing pipe: {:?}", main_module);
+
+        // Add PIPE_FILE to environment variables for non-Next.js pipes
+        env_vars.push((
+            "PIPE_FILE".to_string(),
+            main_module.to_str().unwrap().to_string(),
+        ));
+
+        let mut child = Command::new("bun")
+            .arg("run")
+            .arg(&main_module)
+            .envs(env_vars)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        // Stream logs
+        stream_logs(pipe, &mut child).await?;
+
+        Ok(None)
+    }
+
+    async fn stream_logs(pipe: &str, child: &mut tokio::process::Child) -> Result<()> {
+        let stdout = child.stdout.take().expect("failed to get stdout");
+        let stderr = child.stderr.take().expect("failed to get stderr");
+
+        let pipe_clone = pipe.to_string();
+
+        // Spawn tasks to handle stdout and stderr
+        let stdout_handle = tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                info!("[pipe][info][{}] {}", pipe_clone, line);
             }
+        });
+
+        let pipe_clone = pipe.to_string();
+
+        let stderr_handle = tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("Download") || line.starts_with("Task dev ") {
+                    // Log download messages and task start messages as info instead of error
+                    debug!("[pipe][info][{}] {}", pipe_clone, line);
+                } else {
+                    // Keep other messages as errors
+                    error!("[pipe][error][{}] {}", pipe_clone, line);
+                }
+            }
+        });
+
+        // Wait for the child process to finish
+        let status = child.wait().await?;
+
+        // Wait for the output handling tasks to finish
+        stdout_handle.await?;
+        stderr_handle.await?;
+
+        if !status.success() {
+            anyhow::bail!("pipe execution failed with status: {}", status);
         }
 
+        info!("pipe execution completed successfully");
         Ok(())
     }
 
     pub async fn download_pipe(source: &str, screenpipe_dir: PathBuf) -> anyhow::Result<PathBuf> {
         info!("Processing pipe from source: {}", source);
 
+        let pipe_name =
+            sanitize_pipe_name(Path::new(source).file_name().unwrap().to_str().unwrap());
+        let dest_dir = screenpipe_dir.join("pipes").join(&pipe_name);
+
+        debug!("Destination directory: {:?}", dest_dir);
+
+        // Save existing pipe.json content before downloading
+        let pipe_json_path = dest_dir.join("pipe.json");
+        let existing_config = if pipe_json_path.exists() {
+            debug!("Existing pipe.json found");
+            let content = tokio::fs::read_to_string(&pipe_json_path).await?;
+            Some(serde_json::from_str::<Value>(&content)?)
+        } else {
+            debug!("No existing pipe.json found");
+            None
+        };
+
+        // Create temp directory for download
+        let temp_dir = dest_dir.with_extension("_temp");
+        tokio::fs::create_dir_all(&temp_dir).await?;
+
+        // Download to temp directory first
         if let Ok(parsed_url) = Url::parse(source) {
-            // Handle URLs
-            let client = Client::new();
-            match parsed_url.host_str() {
-                Some("github.com") => {
-                    let api_url = get_raw_github_url(source)
-                        .map_err(|e| anyhow::anyhow!("Failed to parse GitHub URL: {}", e))?;
-                    let pipe_name = sanitize_pipe_name(
-                        Path::new(&api_url).file_name().unwrap().to_str().unwrap(),
-                    );
-                    download_github_folder(&client, &api_url, screenpipe_dir, &pipe_name).await
-                }
-                Some("raw.githubusercontent.com") => {
-                    let pipe_name = sanitize_pipe_name(
-                        Path::new(source).file_name().unwrap().to_str().unwrap(),
-                    );
-                    download_single_file(&client, source, screenpipe_dir, &pipe_name).await
-                }
-                _ => anyhow::bail!("Unsupported URL format"),
+            debug!("Source is a URL: {}", parsed_url);
+            if parsed_url.host_str() == Some("github.com") {
+                download_github_folder(&parsed_url, &temp_dir).await?;
+            } else {
+                anyhow::bail!("Unsupported URL format");
             }
         } else {
-            // Handle local folders
+            debug!("Source is a local path");
             let source_path = Path::new(source);
-            if !source_path.exists() {
-                anyhow::bail!("Local source path does not exist");
+            if !source_path.exists() || !source_path.is_dir() {
+                anyhow::bail!("Invalid local source path");
             }
-            if !source_path.is_dir() {
-                anyhow::bail!("Local source is not a directory");
-            }
-
-            let pipe_name = sanitize_pipe_name(
-                source_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("unknown_pipe"),
-            );
-            let dest_dir = screenpipe_dir.join("pipes").join(&pipe_name);
-
-            tokio::fs::create_dir_all(&dest_dir).await?;
-            copy_local_folder(source_path, &dest_dir).await?;
-
-            info!("Local pipe copied successfully to: {:?}", dest_dir);
-            Ok(dest_dir)
+            copy_dir_all(source_path, &temp_dir).await?;
         }
+
+        // If download successful, move temp dir to final location
+        if dest_dir.exists() {
+            tokio::fs::remove_dir_all(&dest_dir).await?;
+        }
+        tokio::fs::rename(&temp_dir, &dest_dir).await?;
+
+        // Restore or merge pipe.json if needed
+        if let Some(ref existing_config) = existing_config {
+            let new_config_path = dest_dir.join("pipe.json");
+            if new_config_path.exists() {
+                let content = tokio::fs::read_to_string(&new_config_path).await?;
+                let new_json: Value = serde_json::from_str(&content)?;
+
+                // Create merged config
+                let mut merged_config = new_json.clone(); // Start with new schema
+
+                // If both configs have fields array, preserve user values
+                if let (Some(existing_obj), Some(new_obj)) =
+                    (existing_config.as_object(), merged_config.as_object_mut())
+                {
+                    // Copy over non-fields properties from existing config
+                    for (key, value) in existing_obj {
+                        if key != "fields" {
+                            new_obj.insert(key.clone(), value.clone());
+                        }
+                    }
+
+                    // For fields array, preserve user values while keeping new schema
+                    if let (Some(existing_fields), Some(new_fields)) = (
+                        existing_config["fields"].as_array(),
+                        new_obj.get_mut("fields").and_then(|f| f.as_array_mut()),
+                    ) {
+                        // For each field in the new schema
+                        for new_field in new_fields {
+                            if let Some(name) = new_field.get("name").and_then(Value::as_str) {
+                                // If this field existed in the old config, preserve its value
+                                if let Some(existing_field) = existing_fields
+                                    .iter()
+                                    .find(|f| f.get("name").and_then(Value::as_str) == Some(name))
+                                {
+                                    if let Some(user_value) = existing_field.get("value") {
+                                        if let Some(new_field_obj) = new_field.as_object_mut() {
+                                            new_field_obj
+                                                .insert("value".to_string(), user_value.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let config_str = serde_json::to_string_pretty(&merged_config)?;
+                tokio::fs::write(&new_config_path, config_str).await?;
+            } else {
+                // If no new config exists, keep the existing one
+                let config_str = serde_json::to_string_pretty(&existing_config)?;
+                tokio::fs::write(&new_config_path, config_str).await?;
+            }
+        }
+
+        // After downloading/copying the pipe, check if it's a Next.js project
+        let package_json_path = dest_dir.join("package.json");
+        if package_json_path.exists() {
+            let package_json = tokio::fs::read_to_string(&package_json_path).await?;
+            let package_data: Value = serde_json::from_str(&package_json)?;
+
+            if package_data["dependencies"].get("next").is_some() {
+                info!("Detected Next.js project, setting up for production");
+
+                // Run npm install
+                let mut install_child = Command::new("bun")
+                    .arg("i")
+                    .current_dir(&dest_dir)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()?;
+
+                // Stream logs for npm install
+                stream_logs("npm install", &mut install_child).await?;
+
+                // Update pipe.json to indicate it's a Next.js project
+                let mut pipe_config = if let Some(existing_json) = &existing_config {
+                    serde_json::from_str(&existing_json.as_str().unwrap())?
+                } else if pipe_json_path.exists() {
+                    let pipe_json = tokio::fs::read_to_string(&pipe_json_path).await?;
+                    serde_json::from_str(&pipe_json)?
+                } else {
+                    json!({})
+                };
+
+                pipe_config["is_nextjs"] = json!(true);
+                let updated_pipe_json = serde_json::to_string_pretty(&pipe_config)?;
+                let mut file = File::create(&pipe_json_path).await?;
+                file.write_all(updated_pipe_json.as_bytes()).await?;
+            }
+        }
+
+        info!("pipe copied successfully to: {:?}", dest_dir);
+        Ok(dest_dir)
     }
 
-    async fn copy_local_folder(src: &Path, dst: &Path) -> anyhow::Result<()> {
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let file_name = entry.file_name();
+    async fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Result<()> {
+        let src = src.as_ref();
+        let dst = dst.as_ref();
+        debug!("copy_dir_all: src={:?}, dst={:?}", src, dst);
 
-            if file_type.is_file() {
-                if file_name
-                    .to_str()
-                    .map(|s| s.ends_with(".ts") || s.ends_with(".js") || s == "pipe.json")
-                    .unwrap_or(false)
-                {
-                    let src_path = entry.path();
-                    let dst_path = dst.join(file_name);
-                    tokio::fs::copy(&src_path, &dst_path).await?;
-                    info!("Copied: {:?} to {:?}", src_path, dst_path);
-                }
-            } else if file_type.is_dir() {
-                // Optionally handle subdirectories if needed
+        tokio::fs::create_dir_all(&dst).await?;
+        debug!("Created destination directory: {:?}", dst);
+
+        let mut entries = tokio::fs::read_dir(src).await?;
+        debug!("Reading source directory: {:?}", src);
+
+        while let Some(entry) = entries.next_entry().await? {
+            let ty = entry.file_type().await?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+
+            debug!("Processing entry: {:?}", src_path);
+
+            if should_ignore(&entry.file_name()) {
+                debug!("Skipping ignored file/directory: {:?}", entry.file_name());
+                continue;
+            }
+
+            if ty.is_dir() {
+                debug!("Entry is a directory, recursing: {:?}", src_path);
+                copy_dir_all_boxed(src_path, dst_path).await?;
+            } else {
+                debug!("Copying file: {:?} to {:?}", src_path, dst_path);
+                tokio::fs::copy(&src_path, &dst_path).await?;
             }
         }
+
+        debug!("Finished copying directory: {:?}", src);
         Ok(())
     }
 
-    async fn download_github_folder(
-        client: &Client,
-        api_url: &str,
-        screenpipe_dir: PathBuf,
-        pipe_name: &str,
-    ) -> anyhow::Result<PathBuf> {
+    fn copy_dir_all_boxed(
+        src: impl AsRef<Path> + Send + 'static,
+        dst: impl AsRef<Path> + Send + 'static,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+        Box::pin(copy_dir_all(src, dst))
+    }
+
+    fn should_ignore(file_name: &std::ffi::OsStr) -> bool {
+        let ignore_list = [
+            "node_modules",
+            ".git",
+            ".next",
+            "dist",
+            "build",
+            ".DS_Store",
+            "Thumbs.db",
+            ".env",
+            ".env.local",
+            ".env.development.local",
+            ".env.test.local",
+            ".env.production.local",
+        ];
+
+        ignore_list.iter().any(|ignored| file_name == *ignored)
+            || file_name.to_str().map_or(false, |s| s.starts_with('.'))
+    }
+
+    async fn download_github_folder(url: &Url, dest_dir: &Path) -> anyhow::Result<()> {
+        let client = Client::new();
+        let api_url = get_raw_github_url(url.as_str())?;
+
         let response = client
-            .get(api_url)
+            .get(&api_url)
             .header("Accept", "application/vnd.github.v3+json")
             .header("User-Agent", "screenpipe")
             .send()
@@ -492,64 +414,23 @@ mod pipes {
         let contents: Value = response.json().await?;
 
         if !contents.is_array() {
-            anyhow::bail!("Invalid response from GitHub API");
+            anyhow::bail!("invalid response from github api");
         }
-
-        let pipe_dir = screenpipe_dir.join("pipes").join(pipe_name);
-
-        // Check if the pipe directory already exists
-        if pipe_dir.exists() {
-            info!("Pipe already exists: {:?}", pipe_dir);
-            return Ok(pipe_dir);
-        }
-
-        tokio::fs::create_dir_all(&pipe_dir).await?;
 
         for item in contents.as_array().unwrap() {
             let file_name = item["name"].as_str().unwrap();
-            if file_name.ends_with(".ts") || file_name.ends_with(".js") || file_name == "pipe.json"
-            {
-                if file_name.starts_with("main")
-                    || file_name.starts_with("pipe")
-                    || file_name == "pipe.json"
-                {
-                    let download_url = item["download_url"].as_str().unwrap();
-                    let file_content = client.get(download_url).send().await?.bytes().await?;
-                    let file_path = pipe_dir.join(file_name);
-                    tokio::fs::write(&file_path, &file_content).await?;
-                    info!("Downloaded: {:?}", file_path);
-                }
+            if !is_hidden_file(std::ffi::OsStr::new(file_name)) {
+                let download_url = item["download_url"].as_str().unwrap();
+                let file_content = client.get(download_url).send().await?.bytes().await?;
+                let file_path = dest_dir.join(file_name);
+                tokio::fs::write(&file_path, &file_content).await?;
+                info!("downloaded: {:?}", file_path);
+            } else {
+                info!("skipping hidden file: {}", file_name);
             }
         }
 
-        info!("Pipe downloaded successfully to: {:?}", pipe_dir);
-        Ok(pipe_dir)
-    }
-
-    async fn download_single_file(
-        client: &Client,
-        url: &str,
-        screenpipe_dir: PathBuf,
-        pipe_name: &str,
-    ) -> anyhow::Result<PathBuf> {
-        let response = client.get(url).send().await?;
-        let content = response.bytes().await?;
-
-        let pipe_dir = screenpipe_dir.join("pipes").join(pipe_name);
-
-        // Check if the pipe directory already exists
-        if pipe_dir.exists() {
-            info!("Pipe already exists: {:?}", pipe_dir);
-            return Ok(pipe_dir);
-        }
-
-        tokio::fs::create_dir_all(&pipe_dir).await?;
-
-        let file_path = pipe_dir.join(pipe_name);
-        tokio::fs::write(&file_path, &content).await?;
-
-        info!("Downloaded single file: {:?}", file_path);
-        Ok(pipe_dir)
+        Ok(())
     }
 
     fn get_raw_github_url(url: &str) -> anyhow::Result<String> {
@@ -577,17 +458,89 @@ mod pipes {
     }
 
     fn find_pipe_file(pipe_dir: &Path) -> anyhow::Result<PathBuf> {
-        for entry in std::fs::read_dir(pipe_dir)? {
+        for entry in fs::read_dir(pipe_dir)? {
             let entry = entry?;
             let file_name = entry.file_name();
             let file_name_str = file_name.to_str().unwrap();
-            if (file_name_str.starts_with("pipe") || file_name_str.starts_with("main"))
-                && (file_name_str.ends_with(".ts") || file_name_str.ends_with(".js"))
+            if (file_name_str == "pipe.js" || file_name_str == "pipe.ts")
+                && !is_hidden_file(&file_name)
             {
                 return Ok(entry.path());
             }
         }
-        anyhow::bail!("No pipe.ts, pipe.js, main.ts, or main.js found in the pipe directory")
+        anyhow::bail!("No pipe.js/pipe.ts found in the pipe/dist directory")
+    }
+
+    fn is_hidden_file(file_name: &std::ffi::OsStr) -> bool {
+        file_name
+            .to_str()
+            .map(|s| s.starts_with('.') || s == "Thumbs.db")
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    const BUN_EXECUTABLE_NAME: &str = "bun";
+
+    #[cfg(windows)]
+    const BUN_EXECUTABLE_NAME: &str = "bun.exe";
+
+    pub fn find_bun() -> Option<PathBuf> {
+        debug!("starting search for bun executable");
+
+        if let Ok(path) = which(BUN_EXECUTABLE_NAME) {
+            debug!("found bun in PATH: {:?}", path);
+            return Some(path);
+        }
+        debug!("bun not found in PATH");
+
+        if let Ok(cwd) = std::env::current_dir() {
+            debug!("current working directory: {:?}", cwd);
+            let bun_in_cwd = cwd.join(BUN_EXECUTABLE_NAME);
+            if bun_in_cwd.is_file() && bun_in_cwd.exists() {
+                debug!("found bun in current working directory: {:?}", bun_in_cwd);
+                return Some(bun_in_cwd);
+            }
+            debug!("bun not found in current working directory");
+        }
+
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_folder) = exe_path.parent() {
+                debug!("executable folder: {:?}", exe_folder);
+                let bun_in_exe_folder = exe_folder.join(BUN_EXECUTABLE_NAME);
+                if bun_in_exe_folder.exists() {
+                    debug!("found bun in executable folder: {:?}", bun_in_exe_folder);
+                    return Some(bun_in_exe_folder);
+                }
+                debug!("bun not found in executable folder");
+
+                #[cfg(target_os = "macos")]
+                {
+                    let resources_folder = exe_folder.join("../Resources");
+                    debug!("resources folder: {:?}", resources_folder);
+                    let bun_in_resources = resources_folder.join(BUN_EXECUTABLE_NAME);
+                    if bun_in_resources.exists() {
+                        debug!("found bun in resources folder: {:?}", bun_in_resources);
+                        return Some(bun_in_resources);
+                    }
+                    debug!("bun not found in resources folder");
+                }
+
+                #[cfg(target_os = "linux")]
+                {
+                    let lib_folder = exe_folder.join("lib");
+                    debug!("lib folder: {:?}", lib_folder);
+                    let bun_in_lib = lib_folder.join(BUN_EXECUTABLE_NAME);
+                    if bun_in_lib.exists() {
+                        debug!("found bun in lib folder: {:?}", bun_in_lib);
+                        return Some(bun_in_lib);
+                    }
+                    debug!("bun not found in lib folder");
+                }
+            }
+        }
+
+        error!("bun not found");
+        None // return None if bun is not found
     }
 }
 

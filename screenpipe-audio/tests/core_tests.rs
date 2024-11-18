@@ -2,14 +2,20 @@
 mod tests {
     use chrono::Utc;
     use log::{debug, LevelFilter};
-    use screenpipe_audio::vad_engine::{VadEngineEnum, VadSensitivity};
-    use screenpipe_audio::{default_output_device, list_audio_devices, AudioTranscriptionEngine};
+    use screenpipe_audio::stt::stt;
+    use screenpipe_audio::vad_engine::{SileroVad, VadEngine, VadEngineEnum, VadSensitivity};
+    use screenpipe_audio::whisper::WhisperModel;
+    use screenpipe_audio::{
+        default_output_device, list_audio_devices, pcm_decode, AudioInput, AudioStream,
+        AudioTranscriptionEngine,
+    };
     use screenpipe_audio::{parse_audio_device, record_and_transcribe};
+    use screenpipe_core::Language;
     use std::path::PathBuf;
     use std::process::Command;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn setup() {
@@ -44,17 +50,23 @@ mod tests {
         setup();
 
         // Setup
-        let device_spec = Arc::new(default_output_device().await.unwrap());
+        let device_spec = Arc::new(default_output_device().unwrap());
         let duration = Duration::from_secs(30); // Record for 3 seconds
         let time = Utc::now().timestamp_millis();
         let output_path = PathBuf::from(format!("test_output_{}.mp4", time));
         let (sender, receiver) = crossbeam::channel::bounded(100);
         let is_running = Arc::new(AtomicBool::new(true));
+        let is_running_clone = Arc::clone(&is_running);
+
+        let audio_stream = AudioStream::from_device(device_spec, is_running_clone)
+            .await
+            .unwrap();
 
         // Act
         let start_time = Instant::now();
         println!("Starting record_and_transcribe");
-        let result = record_and_transcribe(device_spec, duration, sender, is_running).await;
+        let result =
+            record_and_transcribe(Arc::new(audio_stream), duration, sender, is_running).await;
         println!("record_and_transcribe completed");
         let elapsed_time = start_time.elapsed();
 
@@ -93,13 +105,17 @@ mod tests {
         setup();
 
         // Setup
-        let device_spec = Arc::new(default_output_device().await.unwrap());
+        let device_spec = Arc::new(default_output_device().unwrap());
         let duration = Duration::from_secs(30);
         let time = Utc::now().timestamp_millis();
         let output_path = PathBuf::from(format!("test_output_interrupt_{}.mp4", time));
         let (sender, receiver) = crossbeam::channel::bounded(100);
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
+
+        let audio_stream = AudioStream::from_device(device_spec, is_running_clone.clone())
+            .await
+            .unwrap();
 
         // interrupt in 10 seconds
         tokio::spawn(async move {
@@ -110,7 +126,7 @@ mod tests {
         // Act
         let start_time = Instant::now();
 
-        record_and_transcribe(device_spec, duration, sender, is_running)
+        record_and_transcribe(Arc::new(audio_stream), duration, sender, is_running)
             .await
             .unwrap();
 
@@ -187,7 +203,7 @@ mod tests {
         // 3. the test should succeed (takes ~120s for some reason?) ! i think whisper is just slow as hell on cpu?
 
         // Setup
-        let device_spec = Arc::new(default_output_device().await.unwrap());
+        let device_spec = Arc::new(default_output_device().unwrap());
         let output_path =
             PathBuf::from(format!("test_output_{}.mp4", Utc::now().timestamp_millis()));
         let output_path_2 = output_path.clone();
@@ -197,6 +213,7 @@ mod tests {
             None,
             &output_path_2.clone(),
             VadSensitivity::High,
+            vec![],
         )
         .await
         .unwrap();
@@ -205,8 +222,12 @@ mod tests {
         let recording_thread = tokio::spawn(async move {
             let device_spec = Arc::clone(&device_spec);
             let whisper_sender = whisper_sender.clone();
+            let audio_stream = AudioStream::from_device(device_spec, is_running.clone())
+                .await
+                .unwrap();
+
             record_and_transcribe(
-                device_spec,
+                Arc::new(audio_stream),
                 Duration::from_secs(15),
                 whisper_sender,
                 is_running,
@@ -259,5 +280,115 @@ mod tests {
         // Clean up
         let _ = recording_thread.abort();
         std::fs::remove_file(output_path_2).unwrap_or_default();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_audio_transcription_language() {
+        setup();
+        use std::sync::Arc;
+
+        // Setup
+        let whisper_model = Arc::new(tokio::sync::Mutex::new(
+            WhisperModel::new(&AudioTranscriptionEngine::WhisperLargeV3Turbo).unwrap(),
+        ));
+        let vad_engine: Arc<tokio::sync::Mutex<Box<dyn VadEngine + Send>>> = Arc::new(
+            tokio::sync::Mutex::new(Box::new(SileroVad::new().await.unwrap())),
+        );
+        let output_path = Arc::new(PathBuf::from("test_output"));
+        let audio_data = screenpipe_audio::pcm_decode(&"test_data/Arifi.wav")
+            .expect("Failed to decode audio file");
+
+        let audio_input = AudioInput {
+            data: Arc::new(audio_data.0),
+            sample_rate: 44100, // hardcoded based on test data sample rate
+            channels: 1,
+            device: Arc::new(screenpipe_audio::default_input_device().unwrap()),
+        };
+
+        let mut vad_engine_guard = vad_engine.lock().await;
+        let mut whisper_model_guard = whisper_model.lock().await;
+        let (transcription_result, _) = stt(
+            &audio_input,
+            &mut *whisper_model_guard,
+            Arc::new(AudioTranscriptionEngine::WhisperLargeV3Turbo),
+            &mut **vad_engine_guard,
+            None,
+            &output_path,
+            true,
+            vec![],
+        )
+        .await
+        .unwrap();
+        drop(vad_engine_guard);
+        drop(whisper_model_guard);
+
+        debug!("Received transcription: {:?}", transcription_result);
+        // Check if we received a valid transcription
+        assert!(!transcription_result.is_empty(), "Transcription is empty");
+
+        println!("Received transcription: {}", transcription_result);
+
+        assert!(
+            transcription_result.contains("موسیقی")
+                || transcription_result.contains("تعال")
+                || transcription_result.contains("الحيوانات")
+        );
+
+        // Clean up
+        std::fs::remove_file("test_output").unwrap_or_default();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_stt_speed() {
+        setup();
+
+        // Load a sample audio file for testing
+        let audio_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join("selah.mp4");
+        let audio_data = pcm_decode(&audio_path).expect("Failed to decode audio file");
+        // Create a temporary output path
+        let output_path =
+            PathBuf::from(format!("test_output_{}.mp4", Utc::now().timestamp_millis()));
+
+        // Create AudioInput from the audio data
+        let audio_input = AudioInput {
+            data: Arc::new(audio_data.0),
+            sample_rate: 16000, // Adjust this based on your test audio
+            channels: 1,
+            device: Arc::new(default_output_device().unwrap()),
+        };
+
+        // Initialize the WhisperModel
+        let mut whisper_model = WhisperModel::new(&AudioTranscriptionEngine::WhisperLargeV3Turbo)
+            .expect("Failed to initialize WhisperModel");
+
+        // Initialize VAD engine
+        let vad_engine: Box<dyn VadEngine + Send> = Box::new(SileroVad::new().await.unwrap());
+        let vad_engine = Arc::new(Mutex::new(vad_engine));
+
+        // Measure transcription time
+        let start_time = Instant::now();
+
+        let _ = stt(
+            &audio_input,
+            &mut whisper_model,
+            Arc::new(AudioTranscriptionEngine::WhisperTiny),
+            &mut **vad_engine.lock().unwrap(),
+            None,
+            &output_path,
+            true,
+            vec![Language::Arabic],
+        )
+        .await;
+
+        let elapsed_time = start_time.elapsed();
+
+        debug!("Transcription completed in {:?}", elapsed_time);
+
+        // Clean up
+        std::fs::remove_file(output_path).unwrap_or_default();
     }
 }

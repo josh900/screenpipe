@@ -1,19 +1,19 @@
-use anyhow::Result;
-use candle::Device;
-use screenpipe_core::{generate_text_streaming, load_llama_model};
-use std::io::BufRead;
-
+#[cfg(feature = "llm")]
 fn main() -> Result<()> {
+    use anyhow::Result;
+    use candle::Device;
+    use screenpipe_core::{generate_text_streaming, load_llama_model};
+    use std::env;
+
     let device = Device::new_metal(0).unwrap_or(Device::new_cuda(0).unwrap_or(Device::Cpu));
 
     let (mut model, tokenizer) = load_llama_model(&device)?;
 
     // use input from stdin if available
-    let prompt = std::io::stdin().lock().lines().next().map_or(
-        "explain quantum computing in simple terms:".to_string(),
-        |line| line.unwrap().to_string(),
-    );
-    let max_tokens = 10;
+    let prompt = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "explain quantum computing in simple terms:".to_string());
+    let max_tokens = 50;
     let temperature = 0.7;
     let top_p = 0.9;
     let seed = 42;
@@ -41,4 +41,9 @@ fn main() -> Result<()> {
 
     println!("\n");
     Ok(())
+}
+
+#[cfg(not(feature = "llm"))]
+fn main() {
+    println!("LLM is not enabled");
 }

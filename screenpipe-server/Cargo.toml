@@ -16,6 +16,7 @@ serde_json = "1.0"
 screenpipe-vision = { path = "../screenpipe-vision" }
 screenpipe-audio = { path = "../screenpipe-audio" }
 screenpipe-core = { path = "../screenpipe-core", features = ["security"] }
+screenpipe-actions = { path = "../screenpipe-actions", optional = true }
 
 # Image processing
 image = { workspace = true }
@@ -24,7 +25,12 @@ image = { workspace = true }
 chrono = { version = "0.4.31", features = ["serde"] }
 
 # Database
-sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-native-tls", "chrono", "migrate"] }
+sqlx = { version = "0.7", features = [
+    "sqlite",
+    "runtime-tokio-native-tls",
+    "chrono",
+    "migrate",
+] }
 
 # Local Embeddings + STT
 candle = { workspace = true }
@@ -36,20 +42,29 @@ anyhow = "1.0.86"
 hf-hub = "0.3.2"
 rand = "0.8.5"
 
+thiserror="1"
+
+#opentelemetry
+opentelemetry = "0.21"
+opentelemetry-appender-tracing = "0.2"
+opentelemetry-otlp = {version="0.14", features=["http-proto","reqwest-rustls","tokio","reqwest-client"]}
+opentelemetry_sdk = {version="0.21",default-features = false,features=["rt-tokio"]}
+opentelemetry-semantic-conventions = "0.13"
+
 # Server
 axum = "0.7.5"
+async-stream = "0.3"
 tokio = { version = "1.15", features = ["full", "tracing"] }
 tower-http = { version = "0.5.2", features = ["cors", "trace"] }
-tokio-stream = "0.1.14"
 
 # Log
 log = { workspace = true }
 env_logger = "0.10"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tracing-appender = "0.2.3"
+tracing-appender = { workspace = true }
 # Cli ! shouldn't be required if using as lib
-clap = { version = "4.3", features = ["derive"] }
+clap = { version = "4.3", features = ["derive", "env"] }
 
 # Memory watchdog
 sysinfo = "0.29.0"
@@ -58,7 +73,7 @@ sysinfo = "0.29.0"
 colored = "2.0"
 
 # Plugins
-tower = "0.4"
+tower = { version = "0.5", features = ["util"] }
 futures = "0.3.17"
 
 # Directory management
@@ -83,18 +98,34 @@ base64 = "0.22.1"
 
 uuid = "1.5.0"
 
-[dev-dependencies]
 tempfile = "3.3.0"
 
+
+url = { version = "2.2.0", optional = true }
+
+
+enigo = { version = "0.2.1", optional = true }
+
+# Scope guard for cancelation of streams
+scopeguard = "1.2.0"
+
+# Bincode for serializing hot cache
+bincode = "1.3.3"
+
+# SHA256 for hashing
+sha2 = "0.10.6"
+
+# Fast random number generator
+fastrand = "2.1.1"
+
+[dev-dependencies]
+tempfile = "3.3.0"
 
 # Benches
 criterion = { workspace = true }
 rand = "0.8"
 
 axum-test = "15.3.0"
-
-# Url encoding
-url = "2.4.0"
 
 [[bench]]
 name = "db_benchmarks"
@@ -105,25 +136,19 @@ name = "new_db_benchmark"
 harness = false
 
 [features]
-default = ["pipes"]
+default = []
 metal = ["candle/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-pipes = [
-    "screenpipe-core/pipes",
-    "tempfile",
-    "url",
-]
-
-[dependencies.tempfile]
-version = "3.2"
-optional = true
-
-[dependencies.url]
-version = "2.2"
-optional = true
-
+mkl = ["candle/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
+pipes = ["screenpipe-core/pipes", "url"]
+llm = ["screenpipe-core/llm"]
+beta = ["screenpipe-core/beta", "dep:screenpipe-actions"]
+experimental = ["enigo"]
 
 [[bin]]
 name = "screenpipe"
 path = "src/bin/screenpipe-server.rs"
 
+
+[package.metadata.cargo-machete]
+ignored = ["url", "opentelemetry-appender-tracing"]

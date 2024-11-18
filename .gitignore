@@ -38,3 +38,10 @@ pnpm-lock.yaml
 
 # Ignore onnxruntime-win-x64-gpu libraries
 onnxruntime-win-x64-gpu*/
+
+# ignore environment variables
+.env
+
+# JavaScript stuff
+node_modules/
+

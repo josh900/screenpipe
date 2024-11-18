@@ -3,6 +3,7 @@ import { useSqlAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
 import { Command } from "cmdk";
 import { Input } from "@/components/ui/input";
 import { Loader2, Search, X } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 interface SqlAutocompleteInputProps {
   id: string;
@@ -10,7 +11,9 @@ interface SqlAutocompleteInputProps {
   value: string;
   onChange: (value: string) => void;
   type: "app" | "window";
-  icon: React.ReactNode;
+  icon?: React.ReactNode;
+  className?: string;
+  onKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void;
 }
 
 export function SqlAutocompleteInput({
@@ -20,6 +23,8 @@ export function SqlAutocompleteInput({
   onChange,
   type,
   icon,
+  className,
+  onKeyDown,
 }: SqlAutocompleteInputProps) {
   const { items, isLoading } = useSqlAutocomplete(type);
   const [open, setOpen] = useState(false);
@@ -71,7 +76,7 @@ export function SqlAutocompleteInput({
   }, []);
 
   return (
-    <div className="relative" ref={commandRef}>
+    <div className={cn("relative", className)} ref={commandRef}>
       <div className="absolute left-2 top-1/2 transform -translate-y-1/2 text-gray-400 z-10 flex items-center">
         {icon}
         <span className="w-2" />
@@ -86,8 +91,10 @@ export function SqlAutocompleteInput({
             value={inputValue}
             onChange={handleInputChange}
             onFocus={() => setOpen(true)}
-            className="pl-10 pr-8 w-full"
+            className={cn("pr-8 w-full", icon ? "pl-7" : "pl-3")}
             autoCorrect="off"
+            aria-autocomplete="none"
+            onKeyDown={onKeyDown}
           />
           {inputValue && (
             <button

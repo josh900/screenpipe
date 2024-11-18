@@ -1,42 +1,21 @@
-const INTERVAL = 60 * 6 * 1; // 1 hour in milliseconds
-const NOTION_API_URL = "https://api.notion.com/v1/pages";
-const NOTION_DATABASE_ID = process.env.SCREENPIPE_NOTION_DATABASE_ID;
-const NOTION_API_KEY = process.env.SCREENPIPE_NOTION_API_KEY;
+import { Client } from "@notionhq/client";
+import { z } from "zod";
+import { generateObject } from "ai";
+import { createOllama } from "ollama-ai-provider";
+import { pipe, ContentItem } from "@screenpipe/js";
 
-interface ScreenData {
-  data: {
-    content: {
-      timestamp: string;
-      text: string;
-    };
-  }[];
-}
+const engineeringLog = z.object({
+  title: z.string(),
+  description: z.string(),
+  tags: z.array(z.string()),
+});
 
-interface EngineeringLog {
-  title: string;
-  description: string;
-  tags: string[];
-}
-
-async function queryScreenpipe(
-  startTime: string,
-  endTime: string
-): Promise<ScreenData> {
-  try {
-    const queryParams = `start_time=${startTime}&end_time=${endTime}&limit=50&content_type=ocr`;
-    const response = await fetch(`http://localhost:3030/search?${queryParams}`);
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    return await response.json();
-  } catch (error) {
-    console.error("Error querying screenpipe:", error);
-    return { data: [] };
-  }
-}
+type EngineeringLog = z.infer<typeof engineeringLog>;
 
 async function generateEngineeringLog(
-  screenData: ScreenData
+  screenData: ContentItem[],
+  ollamaModel: string,
+  ollamaApiUrl: string
 ): Promise<EngineeringLog> {
   const prompt = `Based on the following screen data, generate a concise engineering log entry:
 
@@ -51,107 +30,148 @@ async function generateEngineeringLog(
     }
     Provide 1-3 relevant tags related to the engineering work.`;
 
-  const result = await pipe.post(
-    "http://localhost:11434/api/chat",
-    JSON.stringify({
-      model: "phi3.5",
-      messages: [{ role: "user", content: prompt }],
-      stream: false,
-    })
-  );
+  const provider = createOllama({ baseURL: ollamaApiUrl });
 
-  console.log("AI answer:", result);
+  const response = await generateObject({
+    model: provider(ollamaModel),
+    messages: [{ role: "user", content: prompt }],
+    schema: engineeringLog,
+  });
 
-  const content = result.message.content;
-  return JSON.parse(content);
+  console.log("ai answer:", response);
+
+  return response.object;
 }
 
-async function syncLogToNotion(logEntry: EngineeringLog): Promise<void> {
+async function syncLogToNotion(
+  logEntry: EngineeringLog,
+  notion: Client,
+  databaseId: string
+): Promise<void> {
   try {
     console.log("syncLogToNotion", logEntry);
-    const response = await fetch(NOTION_API_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${NOTION_API_KEY}`,
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        parent: { database_id: NOTION_DATABASE_ID },
-        properties: {
-          Title: { title: [{ text: { content: logEntry.title } }] },
-          Description: {
-            rich_text: [{ text: { content: logEntry.description } }],
-          },
-          Tags: { multi_select: logEntry.tags.map((tag) => ({ name: tag })) },
-          Date: { date: { start: new Date().toISOString() } },
+    await notion.pages.create({
+      parent: { database_id: databaseId },
+      properties: {
+        Title: { title: [{ text: { content: logEntry.title } }] },
+        Description: {
+          rich_text: [{ text: { content: logEntry.description } }],
         },
-      }),
+        Tags: { multi_select: logEntry.tags.map((tag) => ({ name: tag })) },
+        Date: { date: { start: new Date().toISOString() } },
+      },
     });
 
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(
-        `HTTP error! status: ${response.status}, body: ${errorBody}`
-      );
-    }
+    console.log("engineering log synced to notion successfully");
 
-    console.log("Engineering log synced to Notion successfully");
+    // Create markdown table for inbox
+    const markdownTable = `
+| Title | Description | Tags |
+|-------|-------------|------|
+| ${logEntry.title} | ${logEntry.description} | ${logEntry.tags.join(", ")} |
+    `.trim();
+
+    await pipe.inbox.send({
+      title: "engineering log synced",
+      body: `new engineering log entry:\n\n${markdownTable}`,
+    });
   } catch (error) {
-    console.error("Error syncing engineering log to Notion:", error);
+    console.error("error syncing engineering log to notion:", error);
+    await pipe.inbox.send({
+      title: "engineering log error",
+      body: `error syncing engineering log to notion: ${error}`,
+    });
   }
 }
 
-async function streamEngineeringLogsToNotion(): Promise<void> {
-  console.log("Starting Engineering Logs Stream to Notion");
+function streamEngineeringLogsToNotion(): void {
+  console.log("starting engineering logs stream to notion");
 
-  while (true) {
-    try {
-      const now = new Date();
-      const oneHourAgo = new Date(now.getTime() - INTERVAL);
+  const config = pipe.loadPipeConfig();
+  console.log("loaded config:", JSON.stringify(config, null, 2));
 
-      const screenData = await queryScreenpipe(
-        oneHourAgo.toISOString(),
-        now.toISOString()
-      );
+  const interval = config.interval * 1000;
+  const databaseId = config.notionDatabaseId;
+  const apiKey = config.notionApiKey;
+  const ollamaApiUrl = config.ollamaApiUrl;
+  const ollamaModel = config.ollamaModel;
 
-      if (screenData.data && screenData.data.length > 0) {
-        const logEntry = await generateEngineeringLog(screenData);
-        await syncLogToNotion(logEntry);
-      } else {
-        console.log("No relevant engineering work detected in the last hour");
+  const notion = new Client({ auth: apiKey });
+
+  pipe.inbox.send({
+    title: "engineering log stream started",
+    body: `monitoring engineering work every ${config.interval} seconds`,
+  });
+
+  pipe.scheduler
+    .task("generateEngineeringLog")
+    .every(interval)
+    .do(async () => {
+      try {
+        const now = new Date();
+        const oneHourAgo = new Date(now.getTime() - interval);
+
+        const screenData = await pipe.queryScreenpipe({
+          startTime: oneHourAgo.toISOString(),
+          endTime: now.toISOString(),
+          limit: 50,
+          contentType: "ocr",
+        });
+
+        if (screenData && screenData.data.length > 0) {
+          const logEntry = await generateEngineeringLog(
+            screenData.data,
+            ollamaModel,
+            ollamaApiUrl
+          );
+          await syncLogToNotion(logEntry, notion, databaseId);
+        } else {
+          console.log("no relevant engineering work detected in the last hour");
+        }
+      } catch (error) {
+        console.error("error in engineering log pipeline:", error);
+        await pipe.inbox.send({
+          title: "engineering log error",
+          body: `error in engineering log pipeline: ${error}`,
+        });
       }
-    } catch (error) {
-      console.error("Error in engineering log pipeline:", error);
-    }
-    await new Promise((resolve) => setTimeout(resolve, INTERVAL));
-  }
+    });
+
+  pipe.scheduler.start();
 }
 
 streamEngineeringLogsToNotion();
 
 /*
+
 Instructions to run this pipe:
 
-1. Make sure you have Ollama installed and running:
-   https://github.com/jmorganca/ollama
+1. install screenpipe and git clone this repo
+    ```
+    git clone https://github.com/mediar-ai/screenpipe.git
+    cd screenpipe
+    ```
 
-2. Run the phi3.5 model:
-   ollama run phi3.5
+2. install and run ollama:
+   - follow instructions at https://github.com/jmorganca/ollama
+   - run `ollama run phi3.5:3.8b-mini-instruct-q4_K_M`
 
-3. Set up your Notion integration and get your API key:
-   https://www.notion.so/my-integrations
+3. set up notion:
+   - create a notion integration: https://www.notion.so/my-integrations - copy the API key
+   - create a database with properties: Title (text), Description (text), Tags (multi-select), Date (date)
+   - share database with your integration - copy the database ID eg https://www.notion.so/<THIS>?<NOTTHIS>
 
-4. Create a Notion database with the following properties:
-   - Title (title)
-   - Tags (multi-select)
-   - Date (date)
-   - share this page with your integration (click three dots, connections, your integration)
-
-5. Set the following environment variables:
+4. set environment variables:
+   ```
    export SCREENPIPE_NOTION_API_KEY=your_notion_api_key
-   export SCREENPIPE_NOTION_DATABASE_ID=your_notion_database_id # e.g. https://www.notion.so/83c75a51b3bd4a?something
+   export SCREENPIPE_NOTION_DATABASE_ID=your_notion_database_id
+   ```
 
-The pipe will run continuously, checking for engineering work every hour
-and logging it to your Notion database.
+5. run the pipe:
+   ```
+   screenpipe pipe download ./examples/typescript/pipe-screen-to-crm
+   screenpipe pipe enable screen-to-crm
+   screenpipe 
+   ```
+
 */

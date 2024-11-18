@@ -1,13 +1,19 @@
 {
     "bundle": {
         "externalBin": [
-            "screenpipe"
+            "screenpipe",
+            "bun",
+            "ollama"
         ],
         "resources": {
-            "ffmpeg\\bin\\x64\\*": "./",
+            "ffmpeg\\bin\\ffmpeg.exe": "./",
+            "ffmpeg\\bin\\ffprobe.exe": "./",
+            "ffmpeg\\bin\\*.dll": "./",
             "ffmpeg\\lib\\*": "./",
-            "tesseract\\*": "./",
-            "onnxruntime*\\lib\\*.dll": "./"
+            "onnxruntime*\\lib\\onnxruntime.dll": "./",
+            "onnxruntime*\\lib\\onnxruntime_providers_cuda.dll": "./",
+            "onnxruntime*\\lib\\onnxruntime_providers_shared.dll": "./",
+            "lib\\ollama\\*": "./"
         }
     }
 }

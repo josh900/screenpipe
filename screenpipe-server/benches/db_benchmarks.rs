@@ -2,9 +2,10 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand::Rng;
+use screenpipe_audio::AudioDevice;
 use screenpipe_server::{ContentType, DatabaseManager};
-use std::sync::Arc;
 use screenpipe_vision::OcrEngine;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 async fn setup_large_db(size: usize) -> DatabaseManager {
@@ -12,8 +13,8 @@ async fn setup_large_db(size: usize) -> DatabaseManager {
     let mut rng = rand::thread_rng();
 
     for _ in 0..size {
-        let _video_id = db.insert_video_chunk("test_video.mp4").await.unwrap();
-        let frame_id = db.insert_frame().await.unwrap();
+        let _video_id = db.insert_video_chunk("test_video.mp4", "test_device").await.unwrap();
+        let frame_id = db.insert_frame("test_device", None).await.unwrap();
         let ocr_text = format!("OCR text {}", rng.gen::<u32>());
         let text_json = format!(r#"{{"text": "{}"}}"#, ocr_text);
         db.insert_ocr_text(
@@ -30,9 +31,18 @@ async fn setup_large_db(size: usize) -> DatabaseManager {
 
         let audio_id = db.insert_audio_chunk("test_audio.mp4").await.unwrap();
         let audio_text = format!("Audio transcription {}", rng.gen::<u32>());
-        db.insert_audio_transcription(audio_id, &audio_text, 0, "test_engine")
-            .await
-            .unwrap();
+        db.insert_audio_transcription(
+            audio_id,
+            &audio_text,
+            0,
+            "test_engine",
+            &AudioDevice::new(
+                "test_device".to_string(),
+                screenpipe_audio::DeviceType::Input,
+            ),
+        )
+        .await
+        .unwrap();
     }
 
     db
@@ -57,9 +67,20 @@ fn bench_search(c: &mut Criterion) {
                     |b| {
                         b.to_async(&rt).iter(|| async {
                             let db = setup_large_db(size).await;
-                            db.search(query, content_type, 100, 0, None, None, None, None)
-                                .await
-                                .unwrap()
+                            db.search(
+                                query,
+                                content_type,
+                                100,
+                                0,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await
+                            .unwrap()
                         });
                     },
                 );

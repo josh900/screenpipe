@@ -1,3 +1,5 @@
+"use client";
+
 import React, { useEffect, useState } from "react";
 import { Label } from "@/components/ui/label";
 import {
@@ -9,16 +11,19 @@ import {
 } from "./ui/select";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
+import { SqlAutocompleteInput } from "./sql-autocomplete-input";
 import {
   Check,
   ChevronsUpDown,
   Eye,
   HelpCircle,
+  Languages,
   Mic,
   Monitor,
+  AppWindowMac,
   X,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, getCliPath } from "@/lib/utils";
 import {
   Command,
   CommandInput,
@@ -46,6 +51,25 @@ import {
 import { Switch } from "./ui/switch";
 import { Input } from "./ui/input";
 import { Slider } from "./ui/slider";
+import { IconCode } from "./ui/icons";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog";
+import { CodeBlock } from "./ui/codeblock";
+import { useCopyToClipboard } from "@/lib/hooks/use-copy-to-clipboard";
+import { platform } from "@tauri-apps/plugin-os";
+import posthog from "posthog-js";
+import { trace } from "@opentelemetry/api";
+import { initOpenTelemetry } from "@/lib/opentelemetry";
+import { Language } from "@/lib/language";
+import { Command as ShellCommand } from "@tauri-apps/plugin-shell";
+import { CliCommandDialog } from "./cli-command-dialog";
+import { ToastAction } from "@/components/ui/toast";
 
 interface AudioDevice {
   name: string;
@@ -63,15 +87,16 @@ interface MonitorDevice {
 export function RecordingSettings({
   localSettings,
   setLocalSettings,
-  currentPlatform,
 }: {
   localSettings: Settings;
   setLocalSettings: (settings: Settings) => void;
-  currentPlatform: string;
 }) {
   const { settings, updateSettings } = useSettings();
   const [openAudioDevices, setOpenAudioDevices] = React.useState(false);
   const [openMonitors, setOpenMonitors] = React.useState(false);
+  const [openLanguages, setOpenLanguages] = React.useState(false);
+  const [windowsForIgnore, setWindowsForIgnore] = useState("");
+  const [windowsForInclude, setWindowsForInclude] = useState("");
 
   const [availableMonitors, setAvailableMonitors] = useState<MonitorDevice[]>(
     []
@@ -83,9 +108,17 @@ export function RecordingSettings({
   const [isUpdating, setIsUpdating] = useState(false);
   const { health } = useHealthCheck();
   const isDisabled = health?.status_code === 500;
-  console.log("localSettings", localSettings);
-  console.log("settings", settings);
-  console.log("availableMonitors", availableMonitors);
+  const [isMacOS, setIsMacOS] = useState(false);
+  const [isSetupRunning, setIsSetupRunning] = useState(false);
+
+  useEffect(() => {
+    const checkPlatform = async () => {
+      const currentPlatform = await platform();
+      setIsMacOS(currentPlatform === "macos");
+    };
+    checkPlatform();
+  }, []);
+
   useEffect(() => {
     const loadDevices = async () => {
       try {
@@ -115,38 +148,57 @@ export function RecordingSettings({
         setAvailableAudioDevices(audioDevices);
 
         console.log("localSettings", localSettings);
-        // Update local settings if current values are default
+
+        // Update monitors
+        const availableMonitorIds = monitors.map((monitor) =>
+          monitor.id.toString()
+        );
+        let updatedMonitorIds = localSettings.monitorIds.filter((id) =>
+          availableMonitorIds.includes(id)
+        );
+
         if (
-          localSettings.monitorIds.length === 1 &&
-          localSettings.monitorIds[0] === "default" &&
-          monitors.length > 0
+          updatedMonitorIds.length === 0 ||
+          (localSettings.monitorIds.length === 1 &&
+            localSettings.monitorIds[0] === "default" &&
+            monitors.length > 0)
         ) {
-          setLocalSettings({
-            ...localSettings,
-            monitorIds: [
-              monitors.find((monitor) => monitor.is_default)!.id!.toString(),
-            ],
-          });
+          updatedMonitorIds = [
+            monitors.find((monitor) => monitor.is_default)!.id!.toString(),
+          ];
         }
+
+        // Update audio devices
+        const availableAudioDeviceNames = audioDevices.map(
+          (device) => device.name
+        );
+        let updatedAudioDevices = localSettings.audioDevices.filter((device) =>
+          availableAudioDeviceNames.includes(device)
+        );
+
         if (
-          localSettings.audioDevices.length === 1 &&
-          localSettings.audioDevices[0] === "default" &&
-          audioDevices.length > 0
+          updatedAudioDevices.length === 0 ||
+          (localSettings.audioDevices.length === 1 &&
+            localSettings.audioDevices[0] === "default" &&
+            audioDevices.length > 0)
         ) {
-          setLocalSettings({
-            ...localSettings,
-            audioDevices: audioDevices
-              .filter((device) => device.is_default)
-              .map((device) => device.name),
-          });
+          updatedAudioDevices = audioDevices
+            .filter((device) => device.is_default)
+            .map((device) => device.name);
         }
+
+        setLocalSettings({
+          ...localSettings,
+          monitorIds: updatedMonitorIds,
+          audioDevices: updatedAudioDevices,
+        });
       } catch (error) {
         console.error("Failed to load devices:", error);
       }
     };
 
     loadDevices();
-  }, [localSettings, setLocalSettings]);
+  }, [settings]);
 
   const handleUpdate = async () => {
     setIsUpdating(true);
@@ -171,9 +223,38 @@ export function RecordingSettings({
         deepgramApiKey: localSettings.deepgramApiKey,
         fps: localSettings.fps,
         vadSensitivity: localSettings.vadSensitivity,
+        audioChunkDuration: localSettings.audioChunkDuration,
+        analyticsEnabled: localSettings.analyticsEnabled,
+        useChineseMirror: localSettings.useChineseMirror,
+        languages: localSettings.languages,
+        enableBeta: localSettings.enableBeta,
+        enableFrameCache: localSettings.enableFrameCache,
+        enableUiMonitoring: localSettings.enableUiMonitoring,
       };
       console.log("Settings to update:", settingsToUpdate);
       await updateSettings(settingsToUpdate);
+
+      if (!localSettings.analyticsEnabled) {
+        posthog.capture("telemetry", {
+          enabled: false,
+        });
+        // disable opentelemetry
+        trace.disable();
+        posthog.opt_out_capturing();
+        console.log("telemetry disabled");
+      } else {
+        const isDebug = process.env.TAURI_ENV_DEBUG === "true";
+        if (!isDebug) {
+          posthog.opt_in_capturing();
+          posthog.capture("telemetry", {
+            enabled: true,
+          });
+          initOpenTelemetry("82688", new Date().toISOString());
+
+          // enable opentelemetry
+          console.log("telemetry enabled");
+        }
+      }
 
       await invoke("kill_all_sreenpipes");
 
@@ -182,14 +263,14 @@ export function RecordingSettings({
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
       toast({
-        title: "Settings updated successfully",
-        description: "Screenpipe has been restarted with new settings.",
+        title: "settings updated successfully",
+        description: "screenpipe has been restarted with new settings.",
       });
     } catch (error) {
-      console.error("Failed to update settings:", error);
+      console.error("failed to update settings:", error);
       toast({
-        title: "Error updating settings",
-        description: "Please try again or check the logs for more information.",
+        title: "error updating settings",
+        description: "please try again or check the logs for more information.",
         variant: "destructive",
       });
     } finally {
@@ -198,10 +279,19 @@ export function RecordingSettings({
   };
 
   const handleAddIgnoredWindow = (value: string) => {
-    if (value && !localSettings.ignoredWindows.includes(value)) {
+    const lowerCaseValue = value.toLowerCase();
+    if (
+      value &&
+      !localSettings.ignoredWindows
+        .map((w) => w.toLowerCase())
+        .includes(lowerCaseValue)
+    ) {
       setLocalSettings({
         ...localSettings,
         ignoredWindows: [...localSettings.ignoredWindows, value],
+        includedWindows: localSettings.includedWindows.filter(
+          (w) => w.toLowerCase() !== lowerCaseValue
+        ),
       });
     }
   };
@@ -214,10 +304,19 @@ export function RecordingSettings({
   };
 
   const handleAddIncludedWindow = (value: string) => {
-    if (value && !localSettings.includedWindows.includes(value)) {
+    const lowerCaseValue = value.toLowerCase();
+    if (
+      value &&
+      !localSettings.includedWindows
+        .map((w) => w.toLowerCase())
+        .includes(lowerCaseValue)
+    ) {
       setLocalSettings({
         ...localSettings,
         includedWindows: [...localSettings.includedWindows, value],
+        ignoredWindows: localSettings.ignoredWindows.filter(
+          (w) => w.toLowerCase() !== lowerCaseValue
+        ),
       });
     }
   };
@@ -245,6 +344,14 @@ export function RecordingSettings({
     setLocalSettings({ ...localSettings, monitorIds: updatedMonitors });
   };
 
+  const handleLanguageChange = (currentValue: Language) => {
+    const updatedLanguages = localSettings.languages.includes(currentValue)
+      ? localSettings.languages.filter((id) => id !== currentValue)
+      : [...localSettings.languages, currentValue];
+
+    setLocalSettings({ ...localSettings, languages: updatedLanguages });
+  };
+
   const handleAudioDeviceChange = (currentValue: string) => {
     const updatedDevices = localSettings.audioDevices.includes(currentValue)
       ? localSettings.audioDevices.filter((device) => device !== currentValue)
@@ -257,11 +364,8 @@ export function RecordingSettings({
     setLocalSettings({ ...localSettings, usePiiRemoval: checked });
   };
 
-  const handleRestartIntervalChange = (
-    e: React.ChangeEvent<HTMLInputElement>
-  ) => {
-    const newValue = parseInt(e.target.value, 10);
-    setLocalSettings({ ...localSettings, restartInterval: newValue });
+  const handleRestartIntervalChange = (value: number[]) => {
+    setLocalSettings({ ...localSettings, restartInterval: value[0] });
   };
 
   const handleDisableAudioChange = (checked: boolean) => {
@@ -271,7 +375,6 @@ export function RecordingSettings({
   const handleFpsChange = (value: number[]) => {
     setLocalSettings({ ...localSettings, fps: value[0] });
   };
-
 
   const handleVadSensitivityChange = (value: number[]) => {
     const sensitivityMap: { [key: number]: VadSensitivity } = {
@@ -294,6 +397,208 @@ export function RecordingSettings({
     return sensitivityMap[sensitivity];
   };
 
+  const handleAudioChunkDurationChange = (value: number[]) => {
+    setLocalSettings({ ...localSettings, audioChunkDuration: value[0] });
+  };
+
+  const renderOcrEngineOptions = () => {
+    const currentPlatform = platform();
+    return (
+      <>
+        {/* <SelectItem value="unstructured">
+          <div className="flex items-center justify-between w-full space-x-2">
+            <span>unstructured</span>
+            <Badge variant="secondary">cloud</Badge>
+          </div>
+        </SelectItem> */}
+        {currentPlatform === "linux" && (
+          <SelectItem value="tesseract">tesseract</SelectItem>
+        )}
+        {currentPlatform === "windows" && (
+          <SelectItem value="windows-native">windows native</SelectItem>
+        )}
+        {currentPlatform === "macos" && (
+          <SelectItem value="apple-native">apple native</SelectItem>
+        )}
+      </>
+    );
+  };
+
+  const handleAnalyticsToggle = (checked: boolean) => {
+    const newValue = checked;
+    setLocalSettings({ ...localSettings, analyticsEnabled: newValue });
+  };
+
+  const handleChineseMirrorToggle = async (checked: boolean) => {
+    setLocalSettings({ ...localSettings, useChineseMirror: checked });
+    if (checked) {
+      // Trigger setup when the toggle is turned on
+      await runSetup();
+    }
+  };
+
+  const runSetup = async () => {
+    setIsSetupRunning(true);
+    try {
+      const command = ShellCommand.sidecar("screenpipe", ["setup"]);
+      const child = await command.spawn();
+
+      toast({
+        title: "Setting up Chinese mirror",
+        description: "This may take a few minutes...",
+      });
+
+      const outputPromise = new Promise<string>((resolve, reject) => {
+        command.on("close", (data) => {
+          if (data.code !== 0) {
+            reject(new Error(`Command failed with code ${data.code}`));
+          }
+        });
+        command.on("error", (error) => reject(new Error(error)));
+        command.stdout.on("data", (line) => {
+          console.log(line);
+          if (line.includes("screenpipe setup complete")) {
+            resolve("ok");
+          }
+        });
+      });
+
+      const timeoutPromise = new Promise(
+        (_, reject) =>
+          setTimeout(() => reject(new Error("Setup timed out")), 900000) // 15 minutes
+      );
+
+      const result = await Promise.race([outputPromise, timeoutPromise]);
+
+      if (result === "ok") {
+        toast({
+          title: "Chinese mirror setup complete",
+          description: "You can now use the Chinese mirror for downloads.",
+        });
+      } else {
+        throw new Error("Setup failed or timed out");
+      }
+    } catch (error) {
+      console.error("Error setting up Chinese mirror:", error);
+      toast({
+        title: "Error setting up Chinese mirror",
+        description: "Please try again or check the logs for more information.",
+        variant: "destructive",
+      });
+      // Revert the toggle if setup fails
+      setLocalSettings({ ...localSettings, useChineseMirror: false });
+    } finally {
+      setIsSetupRunning(false);
+    }
+  };
+
+  const handleEnableBetaToggle = async (checked: boolean) => {
+    setLocalSettings({ ...localSettings, enableBeta: checked });
+
+    if (checked) {
+      try {
+        const command = ShellCommand.sidecar("screenpipe", ["setup"]);
+        const child = await command.spawn();
+
+        toast({
+          title: "setting up beta features",
+          description: "this may take a few minutes...",
+        });
+
+        const outputPromise = new Promise<string>((resolve, reject) => {
+          command.on("close", (data) => {
+            if (data.code !== 0) {
+              reject(new Error(`command failed with code ${data.code}`));
+            }
+          });
+          command.on("error", (error) => reject(new Error(error)));
+          command.stdout.on("data", (line) => {
+            console.log(line);
+            if (line.includes("screenpipe setup complete")) {
+              resolve("ok");
+            }
+          });
+        });
+
+        const timeoutPromise = new Promise(
+          (_, reject) =>
+            setTimeout(() => reject(new Error("setup timed out")), 900000) // 15 minutes
+        );
+
+        const result = await Promise.race([outputPromise, timeoutPromise]);
+
+        if (result === "ok") {
+          toast({
+            title: "beta features setup complete",
+            description: "you can now use the beta features.",
+          });
+        } else {
+          throw new Error("setup failed or timed out");
+        }
+      } catch (error) {
+        console.error("error setting up beta features:", error);
+        toast({
+          title: "error setting up beta features",
+          description:
+            "please try again or check the logs for more information.",
+          variant: "destructive",
+        });
+        // Revert the toggle if setup fails
+        setLocalSettings({ ...localSettings, enableBeta: false });
+      }
+    }
+  };
+
+  const handleFrameCacheToggle = (checked: boolean) => {
+    setLocalSettings({
+      ...localSettings,
+      enableFrameCache: checked,
+    });
+  };
+
+  const handleShowTimeline = async () => {
+    await invoke("show_timeline");
+  };
+
+  const handleUiMonitoringToggle = async (checked: boolean) => {
+    try {
+      if (checked) {
+        // Check accessibility permissions first
+        const hasPermission = await invoke("check_accessibility_permissions");
+        if (!hasPermission) {
+          toast({
+            title: "accessibility permission required",
+            description:
+              "please grant accessibility permission in system preferences",
+            action: (
+              <ToastAction
+                altText="open preferences"
+                onClick={() => invoke("open_accessibility_preferences")}
+              >
+                open preferences
+              </ToastAction>
+            ),
+            variant: "destructive",
+          });
+          return;
+        }
+      }
+
+      // Just update the local setting - the update button will handle the restart
+      setLocalSettings({
+        ...localSettings,
+        enableUiMonitoring: checked,
+      });
+    } catch (error) {
+      console.error("failed to toggle ui monitoring:", error);
+      toast({
+        title: "error checking accessibility permissions",
+        description: "please try again or check the logs",
+        variant: "destructive",
+      });
+    }
+  };
+
   return (
     <>
       <div className="relative">
@@ -309,7 +614,30 @@ export function RecordingSettings({
         )}
         <Card className={cn(isDisabled && "opacity-50 pointer-events-none")}>
           <CardHeader>
-            <CardTitle className="text-center">recording settings</CardTitle>
+            <div className="flex justify-between items-center">
+              <CardTitle className="text-center">recording settings</CardTitle>
+              <div className="flex space-x-2">
+                <div className="flex flex-col space-y-2">
+                  <Button
+                    onClick={handleUpdate}
+                    disabled={settings.devMode || isUpdating}
+                  >
+                    {isUpdating ? "updating..." : "save and restart"}
+                  </Button>
+                  {settings.devMode ? (
+                    <span className="text-xs text-gray-500 text-center">
+                      not available in dev mode, use CLI args in this case
+                    </span>
+                  ) : (
+                    <span className="text-xs text-gray-500 text-center">
+                      this will restart screenpipe recording process with new
+                      settings
+                    </span>
+                  )}
+                </div>
+                <CliCommandDialog localSettings={localSettings} />
+              </div>
+            </div>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex flex-col space-y-2">
@@ -336,6 +664,9 @@ export function RecordingSettings({
                   </SelectItem>
                   <SelectItem value="whisper-tiny">whisper-tiny</SelectItem>
                   <SelectItem value="whisper-large">whisper-large</SelectItem>
+                  <SelectItem value="whisper-large-v3-turbo">
+                    whisper-large-turbo
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -352,25 +683,7 @@ export function RecordingSettings({
                 <SelectTrigger>
                   <SelectValue placeholder="select ocr engine" />
                 </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="unstructured">
-                    <div className="flex items-center justify-between w-full space-x-2">
-                      <span>unstructured</span>
-                      <Badge variant="secondary">cloud</Badge>
-                    </div>
-                  </SelectItem>
-                  {currentPlatform !== "macos" && (
-                    <SelectItem value="tesseract">tesseract</SelectItem>
-                  )}
-                  {currentPlatform === "windows" && (
-                    <SelectItem value="windows-native">
-                      windows native
-                    </SelectItem>
-                  )}
-                  {currentPlatform === "macos" && (
-                    <SelectItem value="apple-native">apple native</SelectItem>
-                  )}
-                </SelectContent>
+                <SelectContent>{renderOcrEngineOptions()}</SelectContent>
               </Select>
             </div>
 
@@ -513,6 +826,70 @@ export function RecordingSettings({
             </div>
 
             <div className="flex flex-col space-y-2">
+              <Label
+                htmlFor="languages"
+                className="flex items-center space-x-2"
+              >
+                <Languages className="h-4 w-4" />
+                <span>languages</span>
+              </Label>
+              <Popover open={openLanguages} onOpenChange={setOpenLanguages}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    role="combobox"
+                    aria-expanded={openLanguages}
+                    className="w-full justify-between"
+                  >
+                    {localSettings.languages.length > 0
+                      ? `${localSettings.languages.join(", ")}`
+                      : "select languages"}
+                    <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-full p-0">
+                  <Command>
+                    <CommandInput placeholder="search languages..." />
+                    <CommandList>
+                      <CommandEmpty>no language found.</CommandEmpty>
+                      <CommandGroup>
+                        {Object.entries(Language).map(([language, id]) => (
+                          <CommandItem
+                            key={language}
+                            value={language}
+                            onSelect={() => handleLanguageChange(id)}
+                          >
+                            <div className="flex items-center">
+                              <Check
+                                className={cn(
+                                  "mr-2 h-4 w-4",
+                                  localSettings.languages.includes(id)
+                                    ? "opacity-100"
+                                    : "opacity-0"
+                                )}
+                              />
+                              {/* not selectable */}
+                              <span
+                                style={{
+                                  userSelect: "none",
+                                  WebkitUserSelect: "none",
+                                  MozUserSelect: "none",
+                                  msUserSelect: "none",
+                                }}
+                              >
+                                {language}
+                              </span>
+                            </div>
+                          </CommandItem>
+                        ))}
+                      </CommandGroup>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
+            </div>
+
+            <div className="flex flex-col space-y-2">
               <div className="flex items-center space-x-2">
                 <Switch
                   id="piiRemoval"
@@ -562,26 +939,31 @@ export function RecordingSettings({
                     </TooltipTrigger>
                     <TooltipContent>
                       <p>
-                        set how often the recording process should restart.
+                        (not recommended) set how often the recording process
+                        should restart.
                         <br />
-                        0 means no automatic restart.
+                        30 minutes is the minimum interval.
                         <br />
-                        this can help mitigate potential memory leaks or other
-                        issues.
+                        this can help mitigate potential issues.
                       </p>
                     </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
               </Label>
-              <Input
-                id="restartInterval"
-                type="number"
-                min="0"
-                value={localSettings.restartInterval}
-                onChange={handleRestartIntervalChange}
-                className="w-full"
-                placeholder="Enter restart interval in minutes (0 to disable)"
-              />
+              <div className="flex items-center space-x-4">
+                <Slider
+                  id="restartInterval"
+                  min={30}
+                  max={1440} // 24 hours
+                  step={30}
+                  value={[localSettings.restartInterval]}
+                  onValueChange={handleRestartIntervalChange}
+                  className="flex-grow"
+                />
+                <span className="w-16 text-right">
+                  {localSettings.restartInterval} min
+                </span>
+              </div>
             </div>
 
             <div className="flex flex-col space-y-2">
@@ -654,23 +1036,26 @@ export function RecordingSettings({
                 ))}
               </div>
               <div className="flex gap-2">
-                <Input
+                <SqlAutocompleteInput
                   id="ignoredWindows"
-                  placeholder="add window to ignore"
-                  onKeyPress={(e) => {
+                  type="window"
+                  icon={<AppWindowMac className="h-4 w-4" />}
+                  value={windowsForIgnore}
+                  onChange={(value) => setWindowsForIgnore(value)}
+                  placeholder="add windows to ignore"
+                  className="flex-grow"
+                  onKeyDown={(e) => {
                     if (e.key === "Enter") {
-                      handleAddIgnoredWindow(e.currentTarget.value);
-                      e.currentTarget.value = "";
+                      e.preventDefault();
+                      handleAddIgnoredWindow(windowsForIgnore);
+                      setWindowsForIgnore("");
                     }
                   }}
                 />
                 <Button
                   onClick={() => {
-                    const input = document.getElementById(
-                      "ignoredWindows"
-                    ) as HTMLInputElement;
-                    handleAddIgnoredWindow(input.value);
-                    input.value = "";
+                    handleAddIgnoredWindow(windowsForIgnore);
+                    setWindowsForIgnore("");
                   }}
                 >
                   add
@@ -719,23 +1104,26 @@ export function RecordingSettings({
                 ))}
               </div>
               <div className="flex gap-2">
-                <Input
+                <SqlAutocompleteInput
                   id="includedWindows"
+                  type="window"
+                  icon={<AppWindowMac className="h-4 w-4" />}
+                  value={windowsForInclude}
+                  onChange={(value) => setWindowsForInclude(value)}
                   placeholder="add window to include"
-                  onKeyPress={(e) => {
+                  className="flex-grow"
+                  onKeyDown={(e) => {
                     if (e.key === "Enter") {
-                      handleAddIncludedWindow(e.currentTarget.value);
-                      e.currentTarget.value = "";
+                      e.preventDefault();
+                      handleAddIncludedWindow(windowsForInclude);
+                      setWindowsForInclude("");
                     }
                   }}
                 />
                 <Button
                   onClick={() => {
-                    const input = document.getElementById(
-                      "includedWindows"
-                    ) as HTMLInputElement;
-                    handleAddIncludedWindow(input.value);
-                    input.value = "";
+                    handleAddIncludedWindow(windowsForInclude);
+                    setWindowsForInclude("");
                   }}
                 >
                   add
@@ -830,20 +1218,241 @@ export function RecordingSettings({
             </div>
 
             <div className="flex flex-col space-y-2">
-              <Button
-                onClick={handleUpdate}
-                disabled={settings.devMode || isUpdating}
+              <Label
+                htmlFor="audioChunkDuration"
+                className="flex items-center space-x-2"
               >
-                {isUpdating ? "updating..." : "update"}
-              </Button>
-              <Label className="text-center">
-                <span className="text-xs text-gray-500">
-                  {settings.devMode
-                    ? "not available in dev mode, use CLI args in this case"
-                    : "this will restart screenpipe recording process with new settings"}
+                <span>audio chunk duration (seconds)</span>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger>
+                      <HelpCircle className="h-4 w-4 cursor-default" />
+                    </TooltipTrigger>
+                    <TooltipContent side="right">
+                      <p>
+                        adjust the duration of each audio chunk.
+                        <br />
+                        shorter durations may lower resource usage spikes,
+                        <br />
+                        while longer durations may increase transcription
+                        quality.
+                        <br />
+                        deepgram in general works better than whisper if you
+                        want higher quality transcription.
+                      </p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </Label>
+              <div className="flex items-center space-x-4">
+                <Slider
+                  id="audioChunkDuration"
+                  min={5}
+                  max={3000}
+                  step={1}
+                  value={[localSettings.audioChunkDuration]}
+                  onValueChange={handleAudioChunkDurationChange}
+                  className="flex-grow"
+                />
+                <span className="w-12 text-right">
+                  {localSettings.audioChunkDuration} s
                 </span>
+              </div>
+            </div>
+            <div className="flex items-center space-x-2">
+              <Switch
+                id="analytics-toggle"
+                checked={localSettings.analyticsEnabled}
+                onCheckedChange={handleAnalyticsToggle}
+              />
+              <Label
+                htmlFor="analytics-toggle"
+                className="flex items-center space-x-2"
+              >
+                <span>enable telemetry</span>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger>
+                      <HelpCircle className="h-4 w-4 cursor-default" />
+                    </TooltipTrigger>
+                    <TooltipContent side="right">
+                      <p>
+                        telemetry helps us improve screenpipe.
+                        <br />
+                        when enabled, we collect anonymous usage data such as
+                        button clicks.
+                        <br />
+                        we do not collect any screen data, microphone, query
+                        data.
+                        <br />
+                        do not collect any screen data, microphone, query data.
+                        <br />
+                        read more on our data privacy policy at
+                        <br />
+                        <a
+                          href="https://screenpi.pe/privacy"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-primary hover:underline"
+                        >
+                          https://screenpi.pe/privacy
+                        </a>
+                      </p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
               </Label>
             </div>
+            <div className="flex items-center space-x-2">
+              <Switch
+                id="chinese-mirror-toggle"
+                checked={localSettings.useChineseMirror}
+                onCheckedChange={handleChineseMirrorToggle}
+              />
+              <Label
+                htmlFor="chinese-mirror-toggle"
+                className="flex items-center space-x-2"
+              >
+                <span>use chinese mirror for model downloads</span>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger>
+                      <HelpCircle className="h-4 w-4 cursor-default" />
+                    </TooltipTrigger>
+                    <TooltipContent side="right">
+                      <p>
+                        enable this option to use a chinese mirror for
+                        <br />
+                        downloading Hugging Face models
+                        <br />
+                        (e.g. Whisper, embedded Llama, etc.)
+                        <br />
+                        which are blocked in mainland China.
+                      </p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </Label>
+            </div>
+            {/* {isMacOS && (
+              <div className="flex items-center space-x-2">
+                <Switch
+                  id="enable-beta-toggle"
+                  checked={localSettings.enableBeta}
+                  onCheckedChange={handleEnableBetaToggle}
+                />
+                <Label
+                  htmlFor="enable-beta-toggle"
+                  className="flex items-center space-x-2"
+                >
+                  <span>enable beta features</span>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <HelpCircle className="h-4 w-4 cursor-default" />
+                      </TooltipTrigger>
+                      <TooltipContent side="right">
+                        <p>
+                          ⚠️ uses screenpipe cloud and may break screenpipe ⚠️
+                          <br />
+                          • we provide free ChatGPT credits
+                          <br />
+                          • may have privacy implications read our data privacy
+                          policy at
+                          <br />
+                          <a
+                            href="https://screenpi.pe/privacy"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-primary hover:underline"
+                          >
+                            https://screenpi.pe/privacy
+                          </a>
+                          <br />
+                          enables experimental features like{" "}
+                          <a
+                            href="https://x.com/m13v_/status/1843868614165967343"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-primary underline"
+                          >
+                            double slash
+                          </a>
+                          <br />
+                          (only tested on US or German qwertz keyboards)
+                        </p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </Label>
+              </div>
+            )} */}
+            <div className="flex flex-col space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2">
+                  <Switch
+                    id="frame-cache-toggle"
+                    checked={localSettings.enableFrameCache}
+                    onCheckedChange={handleFrameCacheToggle}
+                  />
+                  <Label
+                    htmlFor="frame-cache-toggle"
+                    className="flex items-center space-x-2"
+                  >
+                    <span>enable timeline UI</span>
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger>
+                          <HelpCircle className="h-4 w-4 cursor-default" />
+                        </TooltipTrigger>
+                        <TooltipContent side="right">
+                          <p>
+                            experimental feature that provides a timeline UI
+                            (like rewind.ai).
+                            <br />
+                            may increase CPU usage and memory consumption.
+                          </p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </Label>
+                </div>
+              </div>
+            </div>
+            {isMacOS && (
+              <div className="flex items-center space-x-2">
+                <Switch
+                  id="ui-monitoring-toggle"
+                  checked={localSettings.enableUiMonitoring}
+                  onCheckedChange={handleUiMonitoringToggle}
+                />
+                <Label
+                  htmlFor="ui-monitoring-toggle"
+                  className="flex items-center space-x-2"
+                >
+                  <span>enable UI monitoring</span>
+                  <Badge variant="outline" className="ml-2">
+                    accessibility permissions
+                  </Badge>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <HelpCircle className="h-4 w-4 cursor-default" />
+                      </TooltipTrigger>
+                      <TooltipContent side="right">
+                        <p>
+                          enables monitoring of UI elements and their
+                          interactions.
+                          <br />
+                          this allows for better context in search results
+                          <br />* requires accessibility permission
+                        </p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </Label>
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>

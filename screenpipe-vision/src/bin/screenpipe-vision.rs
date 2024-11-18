@@ -1,4 +1,5 @@
 use clap::Parser;
+use screenpipe_core::Language;
 use screenpipe_vision::{continuous_capture, monitor::get_default_monitor, OcrEngine};
 use std::time::Duration;
 use tokio::sync::mpsc::channel;
@@ -14,6 +15,9 @@ struct Cli {
     /// FPS
     #[arg(long, default_value_t = 1.0)]
     fps: f32,
+
+    #[arg(short = 'l', long, value_enum)]
+    language: Vec<Language>,
 }
 
 #[tokio::main]
@@ -31,6 +35,7 @@ async fn main() {
     let (result_tx, mut result_rx) = channel(512);
 
     let save_text_files = cli.save_text_files;
+    let languages = cli.language;
 
     let monitor = get_default_monitor().await;
     let id = monitor.id();
@@ -44,6 +49,7 @@ async fn main() {
             id,
             &[],
             &[],
+            languages.clone(),
         )
         .await
     });
@@ -51,14 +57,15 @@ async fn main() {
     // Example: Process results for 10 seconds, then pause for 5 seconds, then stop
     loop {
         if let Some(result) = result_rx.recv().await {
-            println!(
-                "OCR Text length across visible windows: {}",
-                result
-                    .window_ocr_results
-                    .iter()
-                    .map(|w| w.text.len())
-                    .sum::<usize>()
-            );
+            for window_result in &result.window_ocr_results {
+                println!(
+                    "Window: {}\nApp: {}\nText length: {}\nJSON data: {:?}",
+                    window_result.window_name,
+                    window_result.app_name,
+                    window_result.text.len(),
+                    window_result.text_json // Use {:?} to print the JSON data
+                );
+            }
         }
 
         // tokio::time::sleep(Duration::from_secs_f32(1.0 / cli.fps)).await;
