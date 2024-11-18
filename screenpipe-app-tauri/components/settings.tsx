@@ -79,7 +79,17 @@ export function Settings({ className }: { className?: string }) {
 
   React.useEffect(() => {
     setLocalSettings(settings);
-    setCurrentPlatform(platform());
+    const checkPlatform = async () => {
+      try {
+        const plat = await platform();
+        setCurrentPlatform(plat);
+      } catch (error) {
+        console.error("Failed to get platform:", error);
+        setCurrentPlatform("unknown");
+      }
+    };
+    
+    checkPlatform();
   }, [settings]);
 
   return (
