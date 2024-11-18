@@ -43,6 +43,10 @@ pub use sidecar::kill_all_sreenpipes;
 pub use sidecar::spawn_screenpipe;
 pub use server::spawn_server;
 
+use screenpipe_file_watch::{FileWatcher, FileWatchConfig};
+use sqlx::sqlite::SqlitePoolOptions;
+use tauri::State;
+
 pub struct SidecarState(Arc<tokio::sync::Mutex<Option<SidecarManager>>>);
 
 fn get_base_dir(app: &tauri::AppHandle, custom_path: Option<String>) -> anyhow::Result<PathBuf> {
@@ -69,13 +73,92 @@ fn show_main_window(app_handle: &tauri::AppHandle) {
     }
 }
 
+struct WatcherState(Arc<Mutex<Option<FileWatcher>>>);
+
+#[tauri::command]
+async fn start_watcher(
+    state: State<'_, WatcherState>,
+    watch_dir: String,
+) -> Result<String, String> {
+    let config = FileWatchConfig {
+        watch_directories: vec![watch_dir],
+        file_patterns: vec![
+            "scnpip_*.png".to_string(),
+            "scnpip_*.txt".to_string(),
+        ],
+    };
+
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("screenpipe");
+    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+
+    let database_url = format!("sqlite:{}/db.sqlite", data_dir.display());
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Initialize database schema
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS frames (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME NOT NULL,
+            file_path TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS ocr_text (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            FOREIGN KEY (frame_id) REFERENCES frames(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_frames_timestamp ON frames(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_ocr_text_frame_id ON ocr_text(frame_id);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut watcher = FileWatcher::new(&config, pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    watcher.start_watching(&config).map_err(|e| e.to_string())?;
+
+    let mut state = state.0.lock().await;
+    *state = Some(watcher);
+
+    Ok("Watcher started successfully".to_string())
+}
+
+#[tauri::command]
+async fn get_recent_files(
+    state: State<'_, WatcherState>,
+) -> Result<Vec<String>, String> {
+    if let Some(watcher) = state.0.lock().await.as_ref() {
+        let events = watcher.process_events().await.map_err(|e| e.to_string())?;
+        Ok(events
+            .into_iter()
+            .map(|e| e.path.to_string_lossy().to_string())
+            .collect())
+    } else {
+        Ok(vec![])
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let _ = fix_path_env::fix();
 
     let sidecar_state = SidecarState(Arc::new(tokio::sync::Mutex::new(None)));
 
-    let app = tauri::Builder::default().on_window_event(|window, event| match event {
+    let app = tauri::Builder::default()
+        .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 window.hide().unwrap();
                 api.prevent_close();
@@ -104,6 +187,7 @@ async fn main() {
                 .expect("Can't focus window!");
         }))
         .manage(sidecar_state)
+        .manage(WatcherState(Arc::new(Mutex::new(None))))
         .invoke_handler(tauri::generate_handler![
             spawn_screenpipe,
             kill_all_sreenpipes,
@@ -111,7 +195,9 @@ async fn main() {
             open_screen_capture_preferences,
             load_pipe_config,
             save_pipe_config,
-            reset_all_pipes
+            reset_all_pipes,
+            start_watcher,
+            get_recent_files
         ])
         .setup(|app| {
             // Logging setup
@@ -171,7 +257,6 @@ async fn main() {
                 "registered for autostart? {}",
                 autostart_manager.is_enabled().unwrap()
             );
-
 
             info!("Local data directory: {}", base_dir.display());
 
@@ -274,7 +359,6 @@ async fn main() {
             });
 
             // Dev mode check and sidecar spawn
-
             let use_dev_mode = with_store(app.handle().clone(), stores.clone(), path.clone(), |store| {
                 Ok(store
                     .get("devMode")

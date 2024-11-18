@@ -1,0 +1,12 @@
+{
+    "watch_directories": [
+      "C:\\Users\\user\\Pictures\\Screenshots\\scnpip"
+    ],
+    "file_patterns": [
+      "scnpip_*.png",
+      "scnpip_*.txt"
+    ],
+    "disable_screenshot": true,
+    "disable_audio": true,
+    "use_existing_ocr": true
+  }
